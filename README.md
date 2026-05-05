@@ -60,7 +60,7 @@ If a packaged build is available, download the latest installer for your platfor
 - **Windows:** run the `.msi` or `.exe` installer.
 - **Linux:** use the provided AppImage, `.deb`, or `.rpm` package if published.
 
-Because FlipperUI is still pre-release, some builds may be unsigned. If your OS blocks the first launch, allow it from your system security settings only if you trust the source of the downloaded artifact.
+Because FlipperUI is still pre-release, some builds may be unsigned. If your OS blocks the first launch, allow it from your system security settings only if you trust the source of the downloaded artifact. If you are using macOS, you'll need to grant the app permission by running: `xattr -d com.apple.quarantine /Applications/FlipperUI.app`
 
 ### Option 2: Run from source
 
