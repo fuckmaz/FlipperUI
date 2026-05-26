@@ -10,6 +10,12 @@ import type { NfcEntry } from "../types/nfc";
 import type { RfidEntry } from "../types/rfid";
 import type { BadUsbEntry } from "../types/badusb";
 import type { AppEntry } from "../types/apps";
+import type {
+  GpioMode,
+  GpioPinName,
+  GpioPull,
+  GpioSnapshot,
+} from "../types/gpio";
 import { getCliCleanupPromise } from "../components/CliPanel/CliPanel";
 
 // Helper to await any in-progress CLI cleanup before making RPC calls
@@ -496,6 +502,62 @@ export const appsParsePaths = async (
 export const appsReadIcon = async (path: string): Promise<string | null> => {
   await awaitCliCleanup();
   return invoke<string | null>("apps_read_icon", { path });
+};
+
+// ── GPIO ────────────────────────────────────────────────────────────────
+//
+// The 8 controllable pins are addressed by the proto enum names: PC0, PC1,
+// PC3, PB2, PB3, PA4, PA6, PA7. The OTG bit toggles the +5 V rail on pin 1.
+// Firmware does NOT expose `GetInputPull`, so pull state is tracked
+// frontend-only after each `gpioSetPull` call.
+
+export const gpioSnapshot = async (): Promise<GpioSnapshot> => {
+  await awaitCliCleanup();
+  return invoke<GpioSnapshot>("gpio_snapshot");
+};
+
+export const gpioSetMode = async (
+  pin: GpioPinName,
+  mode: GpioMode,
+): Promise<void> => {
+  await awaitCliCleanup();
+  return invoke<void>("gpio_set_mode", { pin, mode });
+};
+
+export const gpioGetMode = async (pin: GpioPinName): Promise<GpioMode> => {
+  await awaitCliCleanup();
+  return invoke<GpioMode>("gpio_get_mode", { pin });
+};
+
+export const gpioSetPull = async (
+  pin: GpioPinName,
+  pull: GpioPull,
+): Promise<void> => {
+  await awaitCliCleanup();
+  return invoke<void>("gpio_set_pull", { pin, pull });
+};
+
+export const gpioReadPin = async (pin: GpioPinName): Promise<0 | 1> => {
+  await awaitCliCleanup();
+  return invoke<0 | 1>("gpio_read_pin", { pin });
+};
+
+export const gpioWritePin = async (
+  pin: GpioPinName,
+  value: 0 | 1,
+): Promise<void> => {
+  await awaitCliCleanup();
+  return invoke<void>("gpio_write_pin", { pin, value });
+};
+
+export const gpioGetOtg = async (): Promise<boolean> => {
+  await awaitCliCleanup();
+  return invoke<boolean>("gpio_get_otg");
+};
+
+export const gpioSetOtg = async (on: boolean): Promise<void> => {
+  await awaitCliCleanup();
+  return invoke<void>("gpio_set_otg", { on });
 };
 
 // ── Diagnostics ─────────────────────────────────────────────────────────

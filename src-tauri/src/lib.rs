@@ -461,6 +461,14 @@ pub fn run() {
             commands::tray::update_tray_status,
             commands::app_icon::app_icon_variants,
             commands::app_icon::set_app_icon,
+            commands::gpio::gpio_snapshot,
+            commands::gpio::gpio_set_mode,
+            commands::gpio::gpio_get_mode,
+            commands::gpio::gpio_set_pull,
+            commands::gpio::gpio_read_pin,
+            commands::gpio::gpio_write_pin,
+            commands::gpio::gpio_get_otg,
+            commands::gpio::gpio_set_otg,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

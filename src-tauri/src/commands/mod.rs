@@ -6,6 +6,7 @@ pub mod cli;
 pub mod client;
 pub mod device;
 pub mod diag;
+pub mod gpio;
 pub mod gui;
 pub mod infrared;
 pub mod library_prewalk;

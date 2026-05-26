@@ -40,15 +40,10 @@ export function useLibraryPreScan(library: PrewalkLibrary) {
       const settings = await loadSettings();
       if (!settings.libraries.preScanReview) return excludedDirs;
 
-      let flagged: PrewalkDirStat[];
-      try {
-        flagged = await libraryPrewalk(library, roots, excludedDirs);
-      } catch (e) {
-        // If the prewalk fails (e.g. user cancelled, or transport hiccup),
-        // surface the error to the caller via a thrown rejection rather than
-        // silently degrading — matches how the real scan reports failures.
-        throw e;
-      }
+      // If the prewalk fails (e.g. user cancelled, or transport hiccup), let
+      // the rejection propagate to the caller rather than silently degrading
+      // — matches how the real scan reports failures.
+      const flagged = await libraryPrewalk(library, roots, excludedDirs);
       if (flagged.length === 0) return excludedDirs;
 
       return new Promise<string[] | null>((resolve) => {
