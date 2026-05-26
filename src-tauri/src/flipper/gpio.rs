@@ -84,8 +84,9 @@ pub fn get_pin_mode(
     let resp = read_response(&mut *client.transport)?;
     check_response(&resp, id)?;
     match resp.content {
-        Some(Content::GpioGetPinModeResponse(r)) => pb_gpio::GpioPinMode::try_from(r.mode)
-            .map_err(|_| FlipperError::UnexpectedResponse),
+        Some(Content::GpioGetPinModeResponse(r)) => {
+            pb_gpio::GpioPinMode::try_from(r.mode).map_err(|_| FlipperError::UnexpectedResponse)
+        }
         _ => Err(FlipperError::UnexpectedResponse),
     }
 }
@@ -120,9 +121,7 @@ pub fn read_pin(client: &mut FlipperClient, pin: pb_gpio::GpioPin) -> Result<u32
         command_id: id,
         command_status: 0,
         has_next: false,
-        content: Some(Content::GpioReadPin(pb_gpio::ReadPin {
-            pin: pin as i32,
-        })),
+        content: Some(Content::GpioReadPin(pb_gpio::ReadPin { pin: pin as i32 })),
     };
     write_message(&mut *client.transport, &req)?;
     let resp = read_response(&mut *client.transport)?;
@@ -134,11 +133,7 @@ pub fn read_pin(client: &mut FlipperClient, pin: pb_gpio::GpioPin) -> Result<u32
 }
 
 /// Drive a digital value on a pin previously configured as output.
-pub fn write_pin(
-    client: &mut FlipperClient,
-    pin: pb_gpio::GpioPin,
-    value: u32,
-) -> Result<()> {
+pub fn write_pin(client: &mut FlipperClient, pin: pb_gpio::GpioPin, value: u32) -> Result<()> {
     let id = client.next_command_id();
     let req = pb::Main {
         command_id: id,
@@ -168,8 +163,9 @@ pub fn get_otg_mode(client: &mut FlipperClient) -> Result<pb_gpio::GpioOtgMode> 
     let resp = read_response(&mut *client.transport)?;
     check_response(&resp, id)?;
     match resp.content {
-        Some(Content::GpioGetOtgModeResponse(r)) => pb_gpio::GpioOtgMode::try_from(r.mode)
-            .map_err(|_| FlipperError::UnexpectedResponse),
+        Some(Content::GpioGetOtgModeResponse(r)) => {
+            pb_gpio::GpioOtgMode::try_from(r.mode).map_err(|_| FlipperError::UnexpectedResponse)
+        }
         _ => Err(FlipperError::UnexpectedResponse),
     }
 }

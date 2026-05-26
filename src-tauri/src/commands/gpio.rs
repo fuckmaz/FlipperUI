@@ -66,11 +66,7 @@ pub async fn gpio_snapshot(state: State<'_, AppState>) -> Result<GpioSnapshot> {
 }
 
 #[tauri::command]
-pub async fn gpio_set_mode(
-    pin: String,
-    mode: String,
-    state: State<'_, AppState>,
-) -> Result<()> {
+pub async fn gpio_set_mode(pin: String, mode: String, state: State<'_, AppState>) -> Result<()> {
     let client_mutex = Arc::clone(&state.client);
     let mode_mutex = Arc::clone(&state.mode);
 
@@ -103,11 +99,7 @@ pub async fn gpio_get_mode(pin: String, state: State<'_, AppState>) -> Result<St
 }
 
 #[tauri::command]
-pub async fn gpio_set_pull(
-    pin: String,
-    pull: String,
-    state: State<'_, AppState>,
-) -> Result<()> {
+pub async fn gpio_set_pull(pin: String, pull: String, state: State<'_, AppState>) -> Result<()> {
     let client_mutex = Arc::clone(&state.client);
     let mode_mutex = Arc::clone(&state.mode);
 
@@ -139,11 +131,7 @@ pub async fn gpio_read_pin(pin: String, state: State<'_, AppState>) -> Result<u8
 }
 
 #[tauri::command]
-pub async fn gpio_write_pin(
-    pin: String,
-    value: u8,
-    state: State<'_, AppState>,
-) -> Result<()> {
+pub async fn gpio_write_pin(pin: String, value: u8, state: State<'_, AppState>) -> Result<()> {
     let client_mutex = Arc::clone(&state.client);
     let mode_mutex = Arc::clone(&state.mode);
 
