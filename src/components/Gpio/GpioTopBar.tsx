@@ -30,6 +30,9 @@ export function GpioTopBar({
       <div className="flex items-center gap-2 px-3 py-2 flex-wrap">
         <Cpu size={14} className="text-accent" />
         <h2 className="text-xs font-medium text-primary">GPIO</h2>
+        <span className="text-[9px] font-semibold uppercase tracking-wide text-accent">
+          Beta
+        </span>
 
         {/* OTG chip — mirror of the pin-1 switch. */}
         <button
