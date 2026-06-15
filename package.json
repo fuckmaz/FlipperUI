@@ -47,5 +47,8 @@
     "typescript": "~5.8.3",
     "typescript-eslint": "8.51.0",
     "vite": "^8.0.16"
+  },
+  "allowScripts": {
+    "fsevents@2.3.3": true
   }
 }
