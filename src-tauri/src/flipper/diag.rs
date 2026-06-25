@@ -190,9 +190,11 @@ fn content_detail(msg: &pb::Main) -> Option<String> {
             r.data.len(),
             r.orientation
         )),
-        Content::GuiSendInputEventRequest(r) => {
-            Some(format!("key={} type={}", input_key_name(r.key), input_type_name(r.r#type)))
-        }
+        Content::GuiSendInputEventRequest(r) => Some(format!(
+            "key={} type={}",
+            input_key_name(r.key),
+            input_type_name(r.r#type)
+        )),
         _ => None,
     }
 }
