@@ -14,6 +14,7 @@ use crate::state::{AppState, ConnectionMode, InputEventTx};
 const PRESS: i32 = 0;
 const RELEASE: i32 = 1;
 const SHORT: i32 = 2;
+const LONG: i32 = 3;
 
 /// Bound per reader-loop iteration. We process exactly one event between
 /// frame reads so a burst of inputs can't open a long write-only window —
@@ -169,16 +170,22 @@ pub async fn screen_stream_stop(state: State<'_, AppState>) -> Result<()> {
     .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
-/// A SHORT tap expands to PRESS → SHORT → RELEASE — the triplet qFlipper
-/// sends. Many apps only listen for PRESS/RELEASE so a bare SHORT gets
-/// ignored. LONG holds are *not* expanded here because the firmware's
-/// long-press threshold is ~300 ms, longer than three back-to-back wire
-/// writes; the frontend drives PRESS / LONG / RELEASE on the actual key
-/// lifecycle so the hold registers as a real long press.
+/// A SHORT or LONG tap expands to PRESS → (SHORT|LONG) → RELEASE — the bracketed
+/// triplet qFlipper sends. Apps that only watch PRESS/RELEASE (games, custom
+/// ViewPorts) need the surrounding press/release, while apps that act on the
+/// SHORT/LONG type get it in between.
+///
+/// LONG is expanded here too. An RPC-injected `InputTypeLong` is delivered to
+/// the focused app directly — the firmware does *not* re-derive long-press from
+/// hold duration the way it does for the physical buttons, so there's no need
+/// to space the events out over ~300 ms. Sending the triplet atomically (one
+/// reader iteration, back-to-back writes) is what makes the long press reliably
+/// register; a standalone LONG spread across the key lifecycle was being
+/// dropped, which is why long-press appeared not to work.
 fn write_input(client: &mut FlipperClient, key: i32, input_type: i32) -> Result<()> {
-    if input_type == SHORT {
+    if input_type == SHORT || input_type == LONG {
         gui::send_input_event(client, key, PRESS)?;
-        gui::send_input_event(client, key, SHORT)?;
+        gui::send_input_event(client, key, input_type)?;
         gui::send_input_event(client, key, RELEASE)?;
         Ok(())
     } else {

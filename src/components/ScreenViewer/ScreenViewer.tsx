@@ -33,8 +33,8 @@ const GIF_PALETTE: [number, number, number][] = [
 
 // InputKey enum values from Flipper protobuf
 const KEY_UP = 0, KEY_DOWN = 1, KEY_RIGHT = 2, KEY_LEFT = 3, KEY_OK = 4, KEY_BACK = 5;
-const INPUT_PRESS = 0;
-const INPUT_RELEASE = 1;
+// We only ever emit SHORT or LONG; the backend brackets each one with the
+// PRESS / RELEASE the firmware needs (see `write_input` in commands/gui.rs).
 const INPUT_SHORT = 2;
 const INPUT_LONG = 3;
 
@@ -62,10 +62,38 @@ function formatScale(scale: number): string {
   return `${scale}x`;
 }
 
-function DpadBtn({ icon, onPress, ariaLabel, label }: { icon: React.ReactNode; onPress: () => void; ariaLabel: string; label?: string }) {
+function DpadBtn({ icon, onShort, onLong, ariaLabel, label }: { icon: React.ReactNode; onShort: () => void; onLong: () => void; ariaLabel: string; label?: string }) {
+  const longTimer = useRef<number | null>(null);
+  const longSent = useRef(false);
+
+  // Mouse press lifecycle, mirroring the keyboard handler: a quick click sends
+  // SHORT; holding past LONG_PRESS_MS sends LONG instead. The end listener is on
+  // `window` (not the button) so releasing after dragging the cursor off the
+  // button still resolves the press and can't leak the long timer.
+  const begin = (e: React.MouseEvent) => {
+    e.preventDefault();
+    longSent.current = false;
+    longTimer.current = window.setTimeout(() => {
+      longSent.current = true;
+      longTimer.current = null;
+      onLong();
+    }, LONG_PRESS_MS);
+
+    const end = () => {
+      window.removeEventListener("mouseup", end);
+      const wasLong = longSent.current;
+      if (longTimer.current != null) {
+        window.clearTimeout(longTimer.current);
+        longTimer.current = null;
+      }
+      if (!wasLong) onShort();
+    };
+    window.addEventListener("mouseup", end);
+  };
+
   return (
     <button
-      onMouseDown={(e) => { e.preventDefault(); onPress(); }}
+      onMouseDown={begin}
       aria-label={ariaLabel}
       className="flex flex-col items-center justify-center gap-0.5 w-9 h-9 rounded-md border border-border-subtle bg-surface hover:bg-elevated hover:border-flipper/40 active:bg-flipper/30 active:border-flipper text-secondary hover:text-primary transition-colors"
       title={ariaLabel}
@@ -320,13 +348,18 @@ export function ScreenViewer() {
     enqueueInput(key, INPUT_SHORT);
   }, [enqueueInput]);
 
+  const longPress = useCallback((key: number) => {
+    enqueueInput(key, INPUT_LONG);
+  }, [enqueueInput]);
+
   // Global keyboard shortcuts while the viewer is open, without requiring focus.
   // Skip if the user is typing in an input (e.g. the CLI) so text entry wins.
   //
-  // Press lifecycle: keydown sends PRESS, sets a LONG_PRESS_MS timer that emits
-  // LONG if the key is still held; keyup cancels the timer (sends SHORT if the
-  // long timer hadn't fired yet) and sends RELEASE. Browser auto-repeat is
-  // ignored — a held key is one continuous press, not a stream of taps.
+  // Press lifecycle: keydown arms a LONG_PRESS_MS timer. If the key is released
+  // before it fires it's a SHORT; if the timer fires first it's a LONG. Either
+  // way exactly one event is emitted, and the backend brackets it with the
+  // PRESS / RELEASE the firmware needs. Browser auto-repeat is ignored — a held
+  // key is one press, not a stream of taps.
   useEffect(() => {
     if (!connected) return;
     const keyMap: Record<string, number> = {
@@ -336,6 +369,17 @@ export function ScreenViewer() {
     };
     type HeldKey = { fkey: number; longTimer: number | null; longSent: boolean };
     const held = new Map<string, HeldKey>();
+
+    // Cancel every armed timer without emitting anything — used on unmount/blur.
+    // Nothing is left "held" on the device because each press resolves to a
+    // self-contained SHORT/LONG (the backend supplies its own RELEASE), so an
+    // interrupted press simply does nothing rather than sticking a key down.
+    const cancelAll = () => {
+      for (const [, entry] of held) {
+        if (entry.longTimer != null) window.clearTimeout(entry.longTimer);
+      }
+      held.clear();
+    };
 
     const isTextTarget = (t: EventTarget | null) => {
       const el = t as HTMLElement | null;
@@ -352,7 +396,6 @@ export function ScreenViewer() {
       if (e.repeat) return; // hold = one press, not many
       if (held.has(e.key)) return;
 
-      enqueueInput(fkey, INPUT_PRESS);
       const entry: HeldKey = { fkey, longTimer: null, longSent: false };
       entry.longTimer = window.setTimeout(() => {
         entry.longSent = true;
@@ -366,36 +409,23 @@ export function ScreenViewer() {
       const entry = held.get(e.key);
       if (!entry) return;
       held.delete(e.key);
+      // Released before the long timer fired → it was a SHORT tap. If the long
+      // already fired, it sent its own event and there's nothing left to do.
       if (entry.longTimer != null) {
         window.clearTimeout(entry.longTimer);
         enqueueInput(entry.fkey, INPUT_SHORT);
       }
-      enqueueInput(entry.fkey, INPUT_RELEASE);
     };
 
-    // Window blur fires when the user alt-tabs while holding a key. without this we'd never see keyup and the device would keep the key held down.
-    const onBlur = () => {
-      for (const [, entry] of held) {
-        if (entry.longTimer != null) window.clearTimeout(entry.longTimer);
-        enqueueInput(entry.fkey, INPUT_RELEASE);
-      }
-      held.clear();
-    };
-
+    // Alt-tabbing mid-hold means we'd never see keyup; drop the pending press.
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
-    window.addEventListener("blur", onBlur);
+    window.addEventListener("blur", cancelAll);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
-      window.removeEventListener("blur", onBlur);
-      // Releasing held keys on unmount avoids leaving the device in a
-      // "key down" state if the user navigates away mid-hold.
-      for (const [, entry] of held) {
-        if (entry.longTimer != null) window.clearTimeout(entry.longTimer);
-        enqueueInput(entry.fkey, INPUT_RELEASE);
-      }
-      held.clear();
+      window.removeEventListener("blur", cancelAll);
+      cancelAll();
     };
   }, [connected, enqueueInput]);
 
@@ -581,17 +611,17 @@ export function ScreenViewer() {
           {/* Directional pad */}
           <div className="grid grid-cols-3 grid-rows-3 gap-1">
             <div />
-            <DpadBtn icon={<ArrowUp size={14} />} onPress={() => press(KEY_UP)} ariaLabel="Up" />
+            <DpadBtn icon={<ArrowUp size={14} />} onShort={() => press(KEY_UP)} onLong={() => longPress(KEY_UP)} ariaLabel="Up" />
             <div />
-            <DpadBtn icon={<ArrowLeft size={14} />} onPress={() => press(KEY_LEFT)} ariaLabel="Left" />
-            <DpadBtn icon={<Check size={14} />} onPress={() => press(KEY_OK)} ariaLabel="OK" />
-            <DpadBtn icon={<ArrowRight size={14} />} onPress={() => press(KEY_RIGHT)} ariaLabel="Right" />
+            <DpadBtn icon={<ArrowLeft size={14} />} onShort={() => press(KEY_LEFT)} onLong={() => longPress(KEY_LEFT)} ariaLabel="Left" />
+            <DpadBtn icon={<Check size={14} />} onShort={() => press(KEY_OK)} onLong={() => longPress(KEY_OK)} ariaLabel="OK" />
+            <DpadBtn icon={<ArrowRight size={14} />} onShort={() => press(KEY_RIGHT)} onLong={() => longPress(KEY_RIGHT)} ariaLabel="Right" />
             <div />
-            <DpadBtn icon={<ArrowDown size={14} />} onPress={() => press(KEY_DOWN)} ariaLabel="Down" />
+            <DpadBtn icon={<ArrowDown size={14} />} onShort={() => press(KEY_DOWN)} onLong={() => longPress(KEY_DOWN)} ariaLabel="Down" />
             <div />
           </div>
           {/* Back */}
-          <DpadBtn icon={<Undo2 size={14} />} onPress={() => press(KEY_BACK)} ariaLabel="Back" label="Back" />
+          <DpadBtn icon={<Undo2 size={14} />} onShort={() => press(KEY_BACK)} onLong={() => longPress(KEY_BACK)} ariaLabel="Back" label="Back" />
         </div>
       )}
     </div>

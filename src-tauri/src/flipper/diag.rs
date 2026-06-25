@@ -190,7 +190,33 @@ fn content_detail(msg: &pb::Main) -> Option<String> {
             r.data.len(),
             r.orientation
         )),
+        Content::GuiSendInputEventRequest(r) => {
+            Some(format!("key={} type={}", input_key_name(r.key), input_type_name(r.r#type)))
+        }
         _ => None,
+    }
+}
+
+fn input_key_name(key: i32) -> String {
+    match key {
+        0 => "UP".into(),
+        1 => "DOWN".into(),
+        2 => "RIGHT".into(),
+        3 => "LEFT".into(),
+        4 => "OK".into(),
+        5 => "BACK".into(),
+        other => format!("Key({other})"),
+    }
+}
+
+fn input_type_name(ty: i32) -> String {
+    match ty {
+        0 => "PRESS".into(),
+        1 => "RELEASE".into(),
+        2 => "SHORT".into(),
+        3 => "LONG".into(),
+        4 => "REPEAT".into(),
+        other => format!("Type({other})"),
     }
 }
 
