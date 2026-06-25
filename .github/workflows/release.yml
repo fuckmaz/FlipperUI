@@ -1,0 +1,116 @@
+name: Release
+
+# Builds installable bundles for every desktop target and publishes them as
+# assets on a *draft* GitHub Release.
+#
+# Trigger by pushing a version tag (e.g. `git tag v0.4.1 && git push --tags`),
+# or run it manually from the Actions tab (workflow_dispatch) to produce a draft
+# without tagging a commit. The release stays a draft so you can review the
+# attached installers before publishing.
+#
+# Targets:
+#   - Windows                 → .msi + NSIS setup .exe
+#   - macOS (Apple Silicon)   → .dmg / .app   (aarch64-apple-darwin)
+#   - macOS (Intel)           → .dmg / .app   (x86_64-apple-darwin, cross-built)
+#   - Linux                   → .deb
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# tauri-action needs write access to create the release and upload assets.
+permissions:
+  contents: write
+
+# Don't cancel an in-flight release build — each matrix leg uploads to the same
+# release and a mid-run cancel could leave it half-populated.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Bundle & release (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS gets two legs: a native Apple Silicon build and an Intel build
+          # cross-compiled on the same runner via the x86_64 Rust target — the
+          # macos-latest SDK ships both architectures.
+          - platform: macos-latest
+            rust_target: aarch64-apple-darwin
+            args: "--target aarch64-apple-darwin"
+            label: macOS-AppleSilicon
+          - platform: macos-latest
+            rust_target: x86_64-apple-darwin
+            args: "--target x86_64-apple-darwin"
+            label: macOS-Intel
+          # ubuntu-22.04 (not -latest) so the .deb links against an older glibc
+          # and installs cleanly on more distros. `--bundles deb` skips the
+          # rpm/appimage bundles you didn't ask for.
+          - platform: ubuntu-22.04
+            rust_target: ""
+            args: "--bundles deb"
+            label: Linux-deb
+          - platform: windows-latest
+            rust_target: ""
+            args: ""
+            label: Windows
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Empty for host-only targets; set installs the cross-target too.
+          targets: ${{ matrix.rust_target }}
+
+      # Tauri v2 on Linux needs webkit2gtk, soup3, and friends to build.
+      - name: Install Linux build deps
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libudev-dev \
+            pkg-config \
+            build-essential
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          # One cache shard per target so the Intel and Apple Silicon builds
+          # don't clobber each other.
+          key: ${{ matrix.label }}
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build bundles & upload to release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # __VERSION__ is substituted with the version from tauri.conf.json, so
+          # the tag/name are consistent whether triggered by a tag push or run
+          # manually. The first matrix leg creates the draft release; the rest
+          # find it by tag and upload their bundles to it.
+          tagName: v__VERSION__
+          releaseName: "FlipperUI v__VERSION__"
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
