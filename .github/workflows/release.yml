@@ -3,7 +3,7 @@ name: Release
 # Builds installable bundles for every desktop target and publishes them as
 # assets on a *draft* GitHub Release.
 #
-# Trigger by pushing a version tag (e.g. `git tag v0.4.1 && git push --tags`),
+# Trigger by pushing a version tag (e.g. `git tag v0.4.5 && git push --tags`),
 # or run it manually from the Actions tab (workflow_dispatch) to produce a draft
 # without tagging a commit. The release stays a draft so you can review the
 # attached installers before publishing.

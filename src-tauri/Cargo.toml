@@ -1,6 +1,6 @@
 [package]
 name = "flipperui"
-version = "0.4.1"
+version = "0.4.5"
 description = "FlipperUI - A Tauri-based Flipper Zero file-manager and Signal-Library"
 authors = ["maz"]
 edition = "2021"

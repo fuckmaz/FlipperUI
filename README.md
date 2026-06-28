@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.4.1-FF8300">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.4.5-FF8300">
   <img alt="React" src="https://img.shields.io/badge/React-19-61DAFB">
   <img alt="Tauri" src="https://img.shields.io/badge/Tauri-v2-24C8DB">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-backend-B7410E">
