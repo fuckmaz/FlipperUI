@@ -5,6 +5,7 @@ import {
   BatteryLow,
   Bluetooth,
   HardDrive,
+  HardDriveDownload,
   Home,
   Info,
   RefreshCw,
@@ -16,6 +17,7 @@ import { useFlipperStore } from "../../store/useFlipperStore";
 import { powerInfo, storageDu, storageInfo } from "../../lib/tauri";
 import { FlipperSvgIcon } from "../ui/FlipperSvgIcon";
 import { DeviceSettingsCard } from "../DeviceSettings/DeviceSettingsCard";
+import { FirmwareFlashModal } from "../FirmwareFlash/FirmwareFlashModal";
 import type { StorageInfo as StorageInfoType } from "../../types/flipper";
 
 import blackFlipper from "../../assets/flipper-zero/FZBlackNormal.svg";
@@ -54,6 +56,7 @@ export function Dashboard() {
   const [internalBytes, setInternalBytes] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [refreshedAt, setRefreshedAt] = useState<number | null>(null);
+  const [showFirmware, setShowFirmware] = useState(false);
   const inflight = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -104,6 +107,16 @@ export function Dashboard() {
       ? "2"
       : "3";
   const flipperImg = flipperVariants[hardwareColor] ?? whiteFlipper;
+
+  // Firmware flashing is USB-only for now. Flashing over BLE is technically
+  // possible but the multi-MB upload at BLE's small chunk size would be
+  // painfully slow, so we deliberately gate the tool to a serial connection.
+  const usbConnected = isConnected && connectionKind === "serial";
+  const firmwareTooltip = !isConnected
+    ? "Connect a Flipper via USB to flash firmware."
+    : connectionKind !== "serial"
+      ? "Firmware flash is USB-only for now — reconnect over USB to flash."
+      : "Flash firmware — USB only.";
 
   return (
     <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
@@ -169,17 +182,39 @@ export function Dashboard() {
                 </div>
               )}
             </div>
-            <button
-              type="button"
-              onClick={() => setActiveView("info")}
-              disabled={!isConnected}
-              title="Detailed view"
-              aria-label="Open device info detailed view"
-              className="absolute bottom-2 right-2 flex items-center gap-1.5 px-2 py-1 text-[11px] text-muted hover:text-primary border border-border-subtle rounded hover:bg-surface/60 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-            >
-              <Info size={12} />
-              Detailed view
-            </button>
+            <div className="absolute bottom-2 right-2 flex items-center gap-2">
+              <div className="relative group/fw">
+                <button
+                  type="button"
+                  onClick={() => setShowFirmware(true)}
+                  disabled={!usbConnected}
+                  aria-label="Open firmware flash tool"
+                  className="flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium text-black bg-accent hover:bg-accent-hover rounded shadow-sm disabled:opacity-40 disabled:pointer-events-none transition-colors"
+                >
+                  <HardDriveDownload size={12} />
+                  Firmware
+                </button>
+                {/* Styled hover tooltip — sits on the wrapper so it still
+                    appears while the button is disabled (BLE / offline). */}
+                <span
+                  role="tooltip"
+                  className="pointer-events-none absolute bottom-full right-0 mb-1.5 w-max max-w-[220px] px-2 py-1 rounded border border-border-subtle bg-elevated text-primary text-[11px] leading-snug text-left shadow-lg opacity-0 translate-y-0.5 group-hover/fw:opacity-100 group-hover/fw:translate-y-0 transition-all duration-150 z-10"
+                >
+                  {firmwareTooltip}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setActiveView("info")}
+                disabled={!isConnected}
+                title="Detailed view"
+                aria-label="Open device info detailed view"
+                className="flex items-center gap-1.5 px-2 py-1 text-[11px] text-muted hover:text-primary border border-border-subtle rounded hover:bg-surface/60 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                <Info size={12} />
+                Detailed view
+              </button>
+            </div>
           </section>
 
           {/* Stat cards */}
@@ -246,6 +281,10 @@ export function Dashboard() {
           </section>
         </div>
       </div>
+
+      {showFirmware && (
+        <FirmwareFlashModal onClose={() => setShowFirmware(false)} />
+      )}
     </div>
   );
 }

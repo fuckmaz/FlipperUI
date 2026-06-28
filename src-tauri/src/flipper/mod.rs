@@ -6,6 +6,7 @@ pub mod cli;
 pub mod client;
 pub mod diag;
 pub mod fap_icon;
+pub mod firmware;
 pub mod framing;
 pub mod gpio;
 pub mod gui;

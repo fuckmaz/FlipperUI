@@ -207,6 +207,35 @@ pub fn reboot(client: &mut FlipperClient, mode: i32) -> Result<()> {
     Ok(())
 }
 
+/// Ask the Flipper to stage a firmware update from an already-uploaded bundle.
+///
+/// `manifest` is the absolute on-device path to the update manifest, e.g.
+/// `/ext/update/f7-update-1.4.3/update.fuf`. The firmware validates the bundle
+/// and replies with an `UpdateResponse` carrying a result code (0 = OK); the
+/// caller maps non-zero codes to a human message. The device does **not** start
+/// applying anything here — that happens on the subsequent `reboot(UPDATE)`.
+///
+/// Returns the raw `UpdateResultCode` (0 = OK). Older firmware may answer with
+/// an `Empty` body on success, which we treat as code 0.
+pub fn request_update(client: &mut FlipperClient, manifest: &str) -> Result<i32> {
+    let id = client.next_command_id();
+    let req = pb::Main {
+        command_id: id,
+        command_status: 0,
+        has_next: false,
+        content: Some(Content::SystemUpdateRequest(pb_system::UpdateRequest {
+            update_manifest: manifest.to_string(),
+        })),
+    };
+    write_message(&mut *client.transport, &req)?;
+    let resp = read_response(&mut *client.transport)?;
+    check_response(&resp, id)?;
+    match resp.content {
+        Some(Content::SystemUpdateResponse(r)) => Ok(r.code),
+        _ => Ok(0),
+    }
+}
+
 /// Validate that a response belongs to the expected command and has OK status.
 /// Every RPC call site should use this instead of bare status checks.
 pub fn check_response(msg: &pb::Main, expected_id: u32) -> Result<()> {

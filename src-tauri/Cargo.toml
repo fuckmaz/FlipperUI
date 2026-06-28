@@ -36,6 +36,15 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"
 once_cell = "1"
 futures = "0.3"
 uuid = "1"
+# Firmware flashing: fetch update bundles over HTTPS, verify, and unpack.
+# `ureq` is a small, fully-blocking HTTP client (rustls + bundled webpki roots,
+# no OpenSSL) that fits the existing blocking serial code without dragging in a
+# second async runtime. `flate2`+`tar` unpack the gzip'd `.tgz` update bundle;
+# `sha2` verifies the download against the directory.json checksum.
+ureq = { version = "2", features = ["tls"] }
+flate2 = "1"
+tar = "0.4"
+sha2 = "0.10"
 
 # macOS-only: AppKit FFI for setting the Dock icon at runtime.
 # `objc2` is already in the dep tree transitively via Tauri/cocoa, so adding
