@@ -357,7 +357,7 @@ pub async fn firmware_flash(
                         emit(&app_up, "upload", "info", "", Some(pct as u32));
                     }
                 },
-                &is_cancelled,
+                is_cancelled,
             )?;
             done = done.saturating_add(file.data.len() as u64);
         }
