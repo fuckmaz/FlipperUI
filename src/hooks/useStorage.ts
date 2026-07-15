@@ -7,7 +7,7 @@ import {
   storageReadDirToLocal,
   storageWriteFromLocal,
   storageMkdir,
-  storageDelete,
+  storageDeleteMany,
   storageRename,
 } from "../lib/tauri";
 import { joinPath } from "../lib/encoding";
@@ -15,13 +15,38 @@ import { basename } from "../lib/path";
 import { notify } from "../lib/notify";
 import { useFlipperStore } from "../store/useFlipperStore";
 
+export interface StorageDeleteTarget {
+  name: string;
+  path: string;
+  isDir: boolean;
+}
+
+export interface StorageDeleteFailure extends StorageDeleteTarget {
+  error: string;
+  fatal: boolean;
+}
+
+export interface StorageDeleteUnattempted extends StorageDeleteTarget {
+  reason: string;
+}
+
+export interface StorageDeleteBatchResult {
+  deleted: StorageDeleteTarget[];
+  failed: StorageDeleteFailure[];
+  unattempted: StorageDeleteUnattempted[];
+}
+
 export function useStorage() {
   const setEntries = useFlipperStore((s) => s.setEntries);
   const setLoading = useFlipperStore((s) => s.setLoading);
   const setError = useFlipperStore((s) => s.setError);
   const setTransferProgress = useFlipperStore((s) => s.setTransferProgress);
 
-  const refresh = useCallback(async (path: string) => {
+  const refresh = useCallback(async (path: string, allowWhileDeleting = false) => {
+    if (
+      useFlipperStore.getState().fileBrowserDeleting &&
+      !allowWhileDeleting
+    ) return;
     setLoading(true);
     setError(null);
     try {
@@ -39,6 +64,7 @@ export function useStorage() {
   }, [setEntries, setLoading, setError]);
 
   const download = useCallback(async (name: string) => {
+    if (useFlipperStore.getState().fileBrowserDeleting) return;
     const currentPath = useFlipperStore.getState().currentPath;
     const remotePath = joinPath(currentPath, name);
     let unlisten: (() => void) | undefined;
@@ -76,6 +102,7 @@ export function useStorage() {
   // remote tree under `<picked>/<folderName>`. Reuses the same
   // `download-progress` event stream as single-file downloads.
   const downloadFolder = useCallback(async (name: string) => {
+    if (useFlipperStore.getState().fileBrowserDeleting) return;
     const currentPath = useFlipperStore.getState().currentPath;
     const remotePath = joinPath(currentPath, name);
     let unlisten: (() => void) | undefined;
@@ -116,6 +143,7 @@ export function useStorage() {
   // `destDir` lets a drop target (folder row) upload into a path that isn't
   // the currently-shown directory. Defaults to currentPath for normal uploads.
   const uploadFile = useCallback(async (localPath: string, destDir?: string) => {
+    if (useFlipperStore.getState().fileBrowserDeleting) return;
     const currentPath = useFlipperStore.getState().currentPath;
     const dir = destDir ?? currentPath;
     let unlisten: (() => void) | undefined;
@@ -153,6 +181,7 @@ export function useStorage() {
   }, [setError, setTransferProgress, refresh]);
 
   const upload = useCallback(async () => {
+    if (useFlipperStore.getState().fileBrowserDeleting) return;
     const selected = await open({ multiple: true });
     if (!selected) return;
     const paths = Array.isArray(selected) ? selected : [selected];
@@ -162,6 +191,7 @@ export function useStorage() {
   }, [uploadFile]);
 
   const mkdir = useCallback(async (name: string) => {
+    if (useFlipperStore.getState().fileBrowserDeleting) return;
     const currentPath = useFlipperStore.getState().currentPath;
     const path = joinPath(currentPath, name);
     try {
@@ -173,6 +203,7 @@ export function useStorage() {
   }, [setError, refresh]);
 
   const rename = useCallback(async (oldName: string, newName: string) => {
+    if (useFlipperStore.getState().fileBrowserDeleting) return;
     if (!newName.trim() || newName === oldName) return;
     const currentPath = useFlipperStore.getState().currentPath;
     const oldPath = joinPath(currentPath, oldName);
@@ -185,16 +216,88 @@ export function useStorage() {
     }
   }, [setError, refresh]);
 
-  const remove = useCallback(async (name: string, isDir: boolean) => {
-    const currentPath = useFlipperStore.getState().currentPath;
-    const path = joinPath(currentPath, name);
-    try {
-      await storageDelete(path, isDir);
-      await refresh(currentPath);
-    } catch (e: unknown) {
-      setError(String(e));
-    }
-  }, [setError, refresh]);
+  /**
+   * Delete a confirmed snapshot of file-browser entries in a controlled,
+   * sequential batch. Callers are responsible for obtaining confirmation
+   * before invoking this helper.
+   *
+   * Rust validates the complete batch and holds one client lock while deleting
+   * sequentially. A single refresh happens after the result returns.
+   */
+  const removeMany = useCallback(async (
+    targets: StorageDeleteTarget[],
+    refreshPath: string,
+  ): Promise<StorageDeleteBatchResult> => {
+    const byPath = new Map(targets.map((target) => [target.path, target]));
+    let result: StorageDeleteBatchResult;
 
-  return { refresh, download, downloadFolder, upload, uploadFile, mkdir, rename, remove };
+    try {
+      const response = await storageDeleteMany(
+        targets.map((target) => ({
+          path: target.path,
+          recursive: target.isDir,
+        })),
+      );
+      result = {
+        deleted: response.deleted.map((target) =>
+          byPath.get(target.path) ?? {
+            name: target.path,
+            path: target.path,
+            isDir: target.recursive,
+          }),
+        failed: response.failed.map((failure) => ({
+          ...(byPath.get(failure.path) ?? {
+            name: failure.path,
+            path: failure.path,
+            isDir: failure.recursive,
+          }),
+          error: failure.error,
+          fatal: failure.fatal,
+        })),
+        unattempted: response.unattempted.map((target) => ({
+          ...(byPath.get(target.path) ?? {
+            name: target.path,
+            path: target.path,
+            isDir: target.recursive,
+          }),
+          reason: response.stopped_reason ?? "The delete batch stopped before this item",
+        })),
+      };
+    } catch (e: unknown) {
+      const reason = String(e);
+      result = {
+        deleted: [],
+        failed: [],
+        unattempted: targets.map((target) => ({ ...target, reason })),
+      };
+    }
+
+    const reachedDevice = result.deleted.length > 0 || result.failed.length > 0;
+    const connectionWasLost = result.failed.some((failure) => failure.fatal);
+
+    // Refresh once only when the batch reached a still-connected device and
+    // the user is still viewing that directory. A fatal disconnect already
+    // clears the file list through the global disconnect handler.
+    if (
+      reachedDevice &&
+      !connectionWasLost &&
+      useFlipperStore.getState().isConnected &&
+      useFlipperStore.getState().currentPath === refreshPath
+    ) {
+      await refresh(refreshPath, true);
+    }
+
+    return result;
+  }, [refresh]);
+
+  return {
+    refresh,
+    download,
+    downloadFolder,
+    upload,
+    uploadFile,
+    mkdir,
+    rename,
+    removeMany,
+  };
 }

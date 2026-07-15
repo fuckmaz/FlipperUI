@@ -20,15 +20,20 @@ export function ConfirmDialog({
   onCancel,
 }: ConfirmDialogProps) {
   const confirmRef = useRef<HTMLButtonElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
-    confirmRef.current?.focus();
+    // Destructive prompts should never put the dangerous action under the
+    // user's next accidental Enter/Space keypress. Preserve confirm-first
+    // focus for ordinary, reversible confirmations.
+    if (destructive) cancelRef.current?.focus();
+    else confirmRef.current?.focus();
     const handler = (e: KeyboardEvent) => {
       if (e.key === "Escape") onCancel();
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [onCancel]);
+  }, [destructive, onCancel]);
 
   return (
     <div
@@ -43,6 +48,7 @@ export function ConfirmDialog({
         <p className="text-xs text-secondary mb-4">{message}</p>
         <div className="flex justify-end gap-2">
           <button
+            ref={cancelRef}
             onClick={onCancel}
             className="px-3 py-1.5 text-xs rounded bg-surface text-secondary hover:text-primary hover:bg-elevated transition-colors"
           >

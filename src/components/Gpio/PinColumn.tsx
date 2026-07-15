@@ -1,11 +1,18 @@
-import { HEADER_PINS, type HeaderPin, type PinKind } from "../../types/gpio";
+import {
+  HEADER_PINS,
+  type GpioObservedMode,
+  type HeaderPin,
+  type PinKind,
+} from "../../types/gpio";
 
 /**
  * Live state used to draw the small status chip next to each RPC pin row.
  * Looked up by pin name (e.g. "PA7"). Missing entries render no chip.
  */
 export interface PinChipMap {
-  [name: string]: { mode: "input" | "output"; value: 0 | 1 } | undefined;
+  [name: string]:
+    | { mode: GpioObservedMode; value: 0 | 1 | null }
+    | undefined;
 }
 
 interface PinColumnProps {
@@ -67,7 +74,9 @@ function PinRow({
   pin: HeaderPin;
   selected: boolean;
   onSelect: () => void;
-  chip: { mode: "input" | "output"; value: 0 | 1 } | undefined;
+  chip:
+    | { mode: GpioObservedMode; value: 0 | 1 | null }
+    | undefined;
   isOtg: boolean;
 }) {
   const stateClasses = selected
@@ -120,13 +129,23 @@ function PinRow({
               "shrink-0 ml-auto flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono tabular-nums border",
               isOtg
                 ? otgChipClasses(chip.value === 1)
+                : chip.mode === "other"
+                  ? "border-warning/30 bg-warning/10 text-warning"
                 : chip.mode === "output"
                   ? "border-accent/40 bg-accent/10 text-accent"
                   : "border-border-subtle bg-surface/60 text-secondary",
             ].join(" ")}
           >
-            <span>{isOtg ? "5V" : chip.mode === "input" ? "IN" : "OUT"}</span>
-            <span className="text-primary">{chip.value}</span>
+            <span>
+              {isOtg
+                ? "5V"
+                : chip.mode === "input"
+                  ? "IN"
+                  : chip.mode === "output"
+                    ? "OUT"
+                    : "ALT"}
+            </span>
+            <span className="text-primary">{chip.value ?? "—"}</span>
           </span>
         )}
       </button>

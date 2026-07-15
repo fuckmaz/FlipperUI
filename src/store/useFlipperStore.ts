@@ -42,6 +42,8 @@ interface FlipperStore {
   entries: FileEntry[];
   isLoading: boolean;
   error: string | null;
+  /** True while one confirmed file-browser delete batch owns the backend client. */
+  fileBrowserDeleting: boolean;
 
   // Transfer state (0–100, null when idle)
   transferProgress: number | null;
@@ -110,6 +112,7 @@ interface FlipperStore {
   setEntries: (entries: FileEntry[]) => void;
   setLoading: (loading: boolean) => void;
   setError: (error: string | null) => void;
+  setFileBrowserDeleting: (deleting: boolean) => void;
   setTransferProgress: (progress: number | null) => void;
   setCliConnected: (connected: boolean) => void;
   addCliLine: (line: { type: "input" | "output" | "error"; text: string }) => void;
@@ -163,6 +166,7 @@ export const useFlipperStore = create<FlipperStore>((set) => ({
   entries: [],
   isLoading: false,
   error: null,
+  fileBrowserDeleting: false,
   transferProgress: null,
   cliConnected: false,
   cliHistory: [],
@@ -216,6 +220,7 @@ export const useFlipperStore = create<FlipperStore>((set) => ({
             currentPath: "/ext",
             entries: [],
             error: null,
+            fileBrowserDeleting: false,
             cliConnected: false,
             cliHistory: [],
             subghzScanning: false,
@@ -245,6 +250,7 @@ export const useFlipperStore = create<FlipperStore>((set) => ({
   setEntries: (entries) => set({ entries }),
   setLoading: (isLoading) => set({ isLoading }),
   setError: (error) => set({ error }),
+  setFileBrowserDeleting: (fileBrowserDeleting) => set({ fileBrowserDeleting }),
   setTransferProgress: (transferProgress) => set({ transferProgress }),
   setCliConnected: (cliConnected) => set({ cliConnected }),
   addCliLine: (line) =>

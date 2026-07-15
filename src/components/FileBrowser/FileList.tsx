@@ -26,7 +26,13 @@ import { loadSettings, subscribeSettings } from "../../lib/settings";
 import { joinPath } from "../../lib/encoding";
 import { Spinner } from "../ui/Spinner";
 import { ContextMenu, type MenuItem } from "../ui/ContextMenu";
+import { ConfirmDialog } from "../ui/ConfirmDialog";
 import type { FileEntry } from "../../types/flipper";
+import type {
+  StorageDeleteFailure,
+  StorageDeleteTarget,
+  StorageDeleteUnattempted,
+} from "../../hooks/useStorage";
 
 const ROW_HEIGHT = 32; // px — fixed height for virtual scrolling
 
@@ -79,8 +85,9 @@ interface FileRowProps {
   isRenaming: boolean;
   isSelected: boolean;
   inlineActions: InlineActions;
+  disabled: boolean;
   onStartRename: (name: string) => void;
-  onDelete: (name: string, isDir: boolean) => void;
+  onDelete: (entry: FileEntry) => void;
   onContextMenu: (e: React.MouseEvent, entry: FileEntry) => void;
   onSelect: (name: string, e: React.MouseEvent) => void;
   style?: React.CSSProperties;
@@ -106,6 +113,7 @@ function FileRow({
   isRenaming,
   isSelected,
   inlineActions,
+  disabled,
   onStartRename,
   onDelete,
   onContextMenu,
@@ -123,7 +131,7 @@ function FileRow({
 
   // Fetch timestamp lazily on hover
   const handleMouseEnter = useCallback(() => {
-    if (isDir) return;
+    if (isDir || disabled) return;
     const fullPath = joinPath(currentPath, entry.name);
     const cached = timestampCache.get(fullPath);
     if (cached) {
@@ -137,7 +145,7 @@ function FileRow({
         setTimestamp(formatted);
       })
       .catch(() => {}); // ignore — timestamp is optional
-  }, [isDir, currentPath, entry.name]);
+  }, [isDir, disabled, currentPath, entry.name]);
 
   useEffect(() => {
     if (isRenaming) {
@@ -150,6 +158,7 @@ function FileRow({
   }, [isRenaming, entry.name]);
 
   const commitRename = async () => {
+    if (disabled) return;
     onStartRename("");
     await rename(entry.name, renameValue);
   };
@@ -160,7 +169,7 @@ function FileRow({
   };
 
   const handleClick = (e: React.MouseEvent) => {
-    if (isRenaming) return;
+    if (isRenaming || disabled) return;
     if (isDir && !e.metaKey && !e.ctrlKey && !e.shiftKey) {
       const newPath = joinPath(currentPath, entry.name);
       setCurrentPath(newPath);
@@ -173,10 +182,13 @@ function FileRow({
   const exportDrag = useExportDrag(joinPath(currentPath, entry.name), entry.name);
   const handleDragStart = useCallback(
     (e: React.DragEvent) => {
-      if (isDir) return;
+      if (isDir || disabled) {
+        e.preventDefault();
+        return;
+      }
       void exportDrag(e);
     },
-    [isDir, exportDrag],
+    [isDir, disabled, exportDrag],
   );
 
   // Folder rows tag themselves with `data-drop-folder` so FileBrowser can
@@ -187,15 +199,16 @@ function FileRow({
     <div
       style={style}
       data-drop-folder={dropFolder}
-      draggable={!isDir && !isRenaming}
+      draggable={!disabled && !isDir && !isRenaming}
       className={`flex items-center gap-2 px-3 border-b border-border-subtle/60 hover:bg-surface/40 group text-sm ${
-        isDir && !isRenaming ? "cursor-pointer" : ""
-      } ${isSelected ? "bg-surface/60" : ""}`}
+        isDir && !isRenaming && !disabled ? "cursor-pointer" : ""
+      } ${isSelected ? "bg-surface/60" : ""} ${disabled ? "opacity-60" : ""}`}
       onClick={handleClick}
       onMouseEnter={handleMouseEnter}
       onDragStart={handleDragStart}
       onContextMenu={(e) => {
         e.preventDefault();
+        if (disabled) return;
         onContextMenu(e, entry);
       }}
       title={timestamp ?? undefined}
@@ -247,8 +260,9 @@ function FileRow({
         >
           {inlineActions.rename && (
             <button
+              disabled={disabled}
               onClick={() => onStartRename(entry.name)}
-              className="p-1 text-secondary hover:text-accent rounded"
+              className="p-1 text-secondary hover:text-accent disabled:opacity-40 rounded"
               title="Rename (F2)"
             >
               <Pencil size={13} />
@@ -256,8 +270,9 @@ function FileRow({
           )}
           {inlineActions.download && !isDir && (
             <button
+              disabled={disabled}
               onClick={() => download(entry.name)}
-              className="p-1 text-secondary hover:text-blue-400 rounded"
+              className="p-1 text-secondary hover:text-blue-400 disabled:opacity-40 rounded"
               title="Download"
             >
               <Download size={13} />
@@ -265,8 +280,9 @@ function FileRow({
           )}
           {inlineActions.delete && (
             <button
-              onClick={() => onDelete(entry.name, isDir)}
-              className="p-1 text-secondary hover:text-danger rounded"
+              disabled={disabled}
+              onClick={() => onDelete(entry)}
+              className="p-1 text-secondary hover:text-danger disabled:opacity-40 rounded"
               title="Delete"
             >
               <Trash2 size={13} />
@@ -317,7 +333,9 @@ export function FileList() {
   const isLoading = useFlipperStore((s) => s.isLoading);
   const currentPath = useFlipperStore((s) => s.currentPath);
   const setError = useFlipperStore((s) => s.setError);
-  const { download, downloadFolder, remove, refresh } = useStorage();
+  const isDeleting = useFlipperStore((s) => s.fileBrowserDeleting);
+  const setIsDeleting = useFlipperStore((s) => s.setFileBrowserDeleting);
+  const { download, downloadFolder, removeMany, refresh } = useStorage();
 
   const [renamingName, setRenamingName] = useState("");
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
@@ -325,6 +343,10 @@ export function FileList() {
   const [sortKey, setSortKey] = useState<SortKey>("name");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
   const [selectedNames, setSelectedNames] = useState<Set<string>>(new Set());
+  const [pendingDelete, setPendingDelete] = useState<{
+    targets: StorageDeleteTarget[];
+    refreshPath: string;
+  } | null>(null);
   const [inlineActions, setInlineActions] = useState<InlineActions>({ rename: true, download: true, delete: true });
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -337,6 +359,7 @@ export function FileList() {
   useEffect(() => {
     setFilter("");
     setSelectedNames(new Set());
+    setPendingDelete(null);
     timestampCache.clear();
   }, [currentPath]);
 
@@ -409,9 +432,68 @@ export function FileList() {
     [currentPath, refresh, setError],
   );
 
+  const requestDelete = useCallback(
+    (deleteEntries: FileEntry[]) => {
+      if (isDeleting || pendingDelete || deleteEntries.length === 0) return;
+
+      setPendingDelete({
+        refreshPath: currentPath,
+        targets: deleteEntries.map((entry) => ({
+          name: entry.name,
+          path: joinPath(currentPath, entry.name),
+          isDir: entry.file_type === 1,
+        })),
+      });
+    },
+    [currentPath, isDeleting, pendingDelete],
+  );
+
+  const confirmDelete = useCallback(async () => {
+    const request = pendingDelete;
+    if (!request || isDeleting) return;
+
+    // Closing the prompt is the point at which the destructive operation is
+    // authorized. Selection remains intact until the batch result is known.
+    setPendingDelete(null);
+    setRenamingName("");
+    setContextMenu(null);
+    setIsDeleting(true);
+
+    try {
+      const result = await removeMany(request.targets, request.refreshPath);
+      const deletedNames = new Set(result.deleted.map((target) => target.name));
+      const retryNames = new Set([
+        ...result.failed.map((target) => target.name),
+        ...result.unattempted.map((target) => target.name),
+      ]);
+
+      if (useFlipperStore.getState().currentPath === request.refreshPath) {
+        setSelectedNames((previous) => {
+          const next = new Set(previous);
+          for (const name of deletedNames) next.delete(name);
+          // Failed entries remain selected (or become selected for an inline
+          // delete) so the user has a clear retry target.
+          for (const name of retryNames) next.add(name);
+          return next;
+        });
+      }
+
+      if (result.failed.length > 0 || result.unattempted.length > 0) {
+        setError(formatDeleteFailures(
+          result.failed,
+          result.unattempted,
+          request.targets.length,
+        ));
+      }
+    } finally {
+      setIsDeleting(false);
+    }
+  }, [isDeleting, pendingDelete, removeMany, setError, setIsDeleting]);
+
   const handleContextMenu = useCallback(
     (e: React.MouseEvent, entry: FileEntry) => {
       e.preventDefault();
+      if (isDeleting) return;
       const isDir = entry.file_type === 1;
       const items: MenuItem[] = [
         {
@@ -433,15 +515,19 @@ export function FileList() {
         });
       }
       items.push({ type: "separator" });
+      const selectedEntries = entries.filter((candidate) => selectedNames.has(candidate.name));
+      const deleteEntries = selectedNames.has(entry.name) && selectedEntries.length > 1
+        ? selectedEntries
+        : [entry];
       items.push({
-        label: "Delete",
+        label: deleteEntries.length > 1 ? `Delete ${deleteEntries.length} selected` : "Delete",
         icon: <Trash2 size={12} />,
-        onClick: () => remove(entry.name, isDir),
+        onClick: () => requestDelete(deleteEntries),
         danger: true,
       });
       setContextMenu({ x: e.clientX, y: e.clientY, items });
     },
-    [download, downloadFolder, handleExtractTar, remove],
+    [download, downloadFolder, entries, handleExtractTar, isDeleting, requestDelete, selectedNames],
   );
 
   // Keyboard shortcuts — use refs so the listener is stable (registered once)
@@ -451,8 +537,12 @@ export function FileList() {
   entriesRef.current = entries;
   const filteredSortedRef = useRef(filteredSorted);
   filteredSortedRef.current = filteredSorted;
-  const removeRef = useRef(remove);
-  removeRef.current = remove;
+  const requestDeleteRef = useRef(requestDelete);
+  requestDeleteRef.current = requestDelete;
+  const isDeletingRef = useRef(isDeleting);
+  isDeletingRef.current = isDeleting;
+  const pendingDeleteRef = useRef(pendingDelete);
+  pendingDeleteRef.current = pendingDelete;
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -460,15 +550,28 @@ export function FileList() {
       const tag = (e.target as HTMLElement).tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return;
 
-      if (e.key === "Delete" || e.key === "Backspace") {
-        // Delete selected files
-        if (selectedNamesRef.current.size > 0) {
+      // The confirmation dialog owns keyboard input while it is open. In
+      // particular, Escape must cancel without clearing the pending selection.
+      if (pendingDeleteRef.current) return;
+      if (isDeletingRef.current) {
+        if (e.key === "Delete" || e.key === "Backspace" || e.key === "F2") {
           e.preventDefault();
-          for (const name of selectedNamesRef.current) {
-            const entry = entriesRef.current.find((en) => en.name === name);
-            if (entry) removeRef.current(name, entry.file_type === 1);
-          }
-          setSelectedNames(new Set());
+        }
+        return;
+      }
+
+      if (e.key === "Delete" || e.key === "Backspace") {
+        // Confirm and delete the selected snapshot as one controlled batch.
+        if (
+          selectedNamesRef.current.size > 0 &&
+          !isDeletingRef.current &&
+          !pendingDeleteRef.current
+        ) {
+          e.preventDefault();
+          const selectedEntries = entriesRef.current.filter((entry) =>
+            selectedNamesRef.current.has(entry.name),
+          );
+          requestDeleteRef.current(selectedEntries);
         }
       } else if (e.key === "F2") {
         // Rename first selected
@@ -489,20 +592,39 @@ export function FileList() {
     return () => window.removeEventListener("keydown", handler);
   }, []);
 
+  // Keep the destructive prompt mounted even if a background refresh swaps
+  // the list into its loading or empty state.
+  const deleteConfirmation = pendingDelete ? (
+    <ConfirmDialog
+      title={deleteDialogTitle(pendingDelete.targets)}
+      message={deleteDialogMessage(pendingDelete.targets)}
+      confirmLabel={pendingDelete.targets.length === 1 ? "Delete" : "Delete all"}
+      destructive
+      onConfirm={() => void confirmDelete()}
+      onCancel={() => setPendingDelete(null)}
+    />
+  ) : null;
+
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center flex-1 gap-2 text-muted">
-        <Spinner size={16} />
-        <span className="text-sm">Loading…</span>
-      </div>
+      <>
+        <div className="flex items-center justify-center flex-1 gap-2 text-muted">
+          <Spinner size={16} />
+          <span className="text-sm">Loading…</span>
+        </div>
+        {deleteConfirmation}
+      </>
     );
   }
 
   if (entries.length === 0) {
     return (
-      <div className="flex items-center justify-center flex-1 text-dim text-sm">
-        {currentPath === "/" ? "No files" : "Empty directory"}
-      </div>
+      <>
+        <div className="flex items-center justify-center flex-1 text-dim text-sm">
+          {currentPath === "/" ? "No files" : "Empty directory"}
+        </div>
+        {deleteConfirmation}
+      </>
     );
   }
 
@@ -560,8 +682,9 @@ export function FileList() {
                     isRenaming={renamingName === entry.name}
                     isSelected={selectedNames.has(entry.name)}
                     inlineActions={inlineActions}
+                    disabled={isDeleting}
                     onStartRename={setRenamingName}
-                    onDelete={(name, isDir) => remove(name, isDir)}
+                    onDelete={(deleteEntry) => requestDelete([deleteEntry])}
                     onContextMenu={handleContextMenu}
                     onSelect={handleSelect}
                     style={{
@@ -583,6 +706,7 @@ export function FileList() {
         <div className="px-3 py-1 text-xs text-dim border-t border-border-subtle/40 shrink-0">
           {filteredSorted.length} item{filteredSorted.length !== 1 ? "s" : ""}
           {selectedNames.size > 0 && ` · ${selectedNames.size} selected`}
+          {isDeleting && " · Deleting…"}
         </div>
       </div>
 
@@ -592,6 +716,50 @@ export function FileList() {
           onClose={() => setContextMenu(null)}
         />
       )}
+
+      {deleteConfirmation}
     </>
   );
+}
+
+function deleteDialogTitle(targets: StorageDeleteTarget[]): string {
+  if (targets.length === 1) return `Delete ${targets[0].name}?`;
+  return `Delete ${targets.length} selected items?`;
+}
+
+function deleteDialogMessage(targets: StorageDeleteTarget[]): string {
+  const folderCount = targets.filter((target) => target.isDir).length;
+  const fileCount = targets.length - folderCount;
+  const counts = [
+    fileCount > 0 ? `${fileCount} file${fileCount === 1 ? "" : "s"}` : "",
+    folderCount > 0 ? `${folderCount} folder${folderCount === 1 ? "" : "s"}` : "",
+  ].filter(Boolean).join(" and ");
+  const shown = targets.slice(0, 4).map((target) => target.name).join(", ");
+  const remainder = targets.length > 4 ? `, and ${targets.length - 4} more` : "";
+  const recursiveWarning = folderCount > 0
+    ? " Selected folders and everything inside them will be removed."
+    : "";
+
+  return `${counts} will be permanently deleted.${recursiveWarning} This cannot be undone. Items: ${shown}${remainder}.`;
+}
+
+function formatDeleteFailures(
+  failures: StorageDeleteFailure[],
+  unattempted: StorageDeleteUnattempted[],
+  attemptedCount: number,
+): string {
+  const deletedCount = attemptedCount - failures.length - unattempted.length;
+  const details = failures
+    .slice(0, 3)
+    .map((failure) => `${failure.name}: ${failure.error}`)
+    .join("; ");
+  const remainder = failures.length > 3
+    ? `; ${failures.length - 3} additional failure${failures.length - 3 === 1 ? "" : "s"}`
+    : "";
+
+  const stopped = unattempted.length > 0
+    ? ` ${unattempted.length} item${unattempted.length === 1 ? " was" : "s were"} not attempted after the batch stopped: ${unattempted[0].reason}.`
+    : "";
+
+  return `Deleted ${deletedCount} of ${attemptedCount} items. Failed or unattempted items remain selected; check the connection and retry them. ${details}${remainder}${stopped}`;
 }

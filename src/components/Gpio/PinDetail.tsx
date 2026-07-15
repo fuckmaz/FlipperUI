@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Eye, EyeOff, Power, Zap, AlertTriangle } from "lucide-react";
 import type {
   GpioMode,
+  GpioObservedMode,
   GpioPinName,
   GpioPull,
   HeaderPin,
@@ -10,8 +11,8 @@ import { Sparkline } from "./Sparkline";
 
 interface RpcPinDetailProps {
   pin: HeaderPin;
-  mode: GpioMode;
-  value: 0 | 1;
+  mode: GpioObservedMode;
+  value: 0 | 1 | null;
   pull: GpioPull;
   watching: boolean;
   samples: ReadonlyArray<0 | 1>;
@@ -72,13 +73,15 @@ export function RpcPinDetail({
           onToggleWatch={onToggleWatch}
           onReadNow={onReadNow}
         />
-      ) : (
+      ) : mode === "output" ? (
         <OutputControls
           value={value}
           busy={busy}
           onWriteValue={onWriteValue}
           onPulse={onPulse}
         />
+      ) : (
+        <OtherModeNotice />
       )}
 
       <Footer text={lastAction} ts={lastActionAt} />
@@ -100,7 +103,7 @@ function InputControls({
   onReadNow,
 }: {
   pin: GpioPinName;
-  value: 0 | 1;
+  value: 0 | 1 | null;
   pull: GpioPull;
   watching: boolean;
   samples: ReadonlyArray<0 | 1>;
@@ -134,7 +137,7 @@ function InputControls({
               ? "border-success/40 bg-success/10"
               : "border-border-subtle bg-surface/60",
           ].join(" ")}
-          aria-label={`${pin} logic level`}
+          aria-label={`${pin} logic level${value === null ? " unknown" : ""}`}
         >
           <span
             aria-hidden
@@ -144,7 +147,7 @@ function InputControls({
             ].join(" ")}
           />
           <span className="text-2xl font-semibold tabular-nums text-primary">
-            {value === 1 ? "HIGH" : "LOW"}
+            {value === null ? "UNKNOWN" : value === 1 ? "HIGH" : "LOW"}
           </span>
           <span className="ml-auto text-[10px] uppercase tracking-wide text-muted">
             logic
@@ -197,11 +200,46 @@ function OutputControls({
   onWriteValue,
   onPulse,
 }: {
-  value: 0 | 1;
+  value: 0 | 1 | null;
   busy: boolean;
   onWriteValue: (value: 0 | 1) => void;
   onPulse: () => void;
 }) {
+  if (value === null) {
+    return (
+      <Section title="Output">
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center gap-3 px-4 py-4 rounded-lg border border-warning/30 bg-warning/10">
+            <span aria-hidden className="w-3 h-3 rounded-full bg-warning" />
+            <span className="text-lg font-semibold text-warning">UNKNOWN</span>
+            <span className="ml-auto text-[10px] uppercase tracking-wide text-muted">
+              output latch is not readable
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={() => onWriteValue(0)}
+              disabled={busy}
+              className="px-3 py-2 text-xs rounded border border-border-subtle bg-surface text-secondary hover:text-primary hover:bg-elevated disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Drive LOW
+            </button>
+            <button
+              type="button"
+              onClick={() => onWriteValue(1)}
+              disabled={busy}
+              className="px-3 py-2 text-xs rounded border border-accent/40 bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Drive HIGH
+            </button>
+          </div>
+          <PulseButton busy={busy} onPulse={onPulse} />
+        </div>
+      </Section>
+    );
+  }
+
   const next: 0 | 1 = value === 1 ? 0 : 1;
   return (
     <Section title="Output">
@@ -230,16 +268,36 @@ function OutputControls({
             click to {value === 1 ? "drive low" : "drive high"}
           </span>
         </button>
-        <button
-          type="button"
-          onClick={onPulse}
-          disabled={busy}
-          title="Drive HIGH for 100 ms, then LOW"
-          className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 text-xs rounded border border-border-subtle bg-surface text-secondary hover:text-primary hover:bg-elevated disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-        >
-          <Zap size={12} />
-          Pulse 100 ms
-        </button>
+        <PulseButton busy={busy} onPulse={onPulse} />
+      </div>
+    </Section>
+  );
+}
+
+function PulseButton({ busy, onPulse }: { busy: boolean; onPulse: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onPulse}
+      disabled={busy}
+      title="Drive HIGH for 100 ms, then LOW"
+      className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 text-xs rounded border border-border-subtle bg-surface text-secondary hover:text-primary hover:bg-elevated disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+    >
+      <Zap size={12} />
+      Pulse 100 ms
+    </button>
+  );
+}
+
+function OtherModeNotice() {
+  return (
+    <Section title="Current state">
+      <div className="flex items-start gap-2 px-3 py-2 rounded border border-warning/30 bg-warning/10 text-[11px] text-warning">
+        <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+        <span>
+          The firmware currently owns this pin in an alternate or analog mode.
+          Choose INPUT or OUTPUT above to take control of it through GPIO RPC.
+        </span>
       </div>
     </Section>
   );

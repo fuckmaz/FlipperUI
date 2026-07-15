@@ -1,16 +1,21 @@
 use std::sync::Arc;
+use std::time::Duration;
 
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
-use crate::commands::client::with_client;
+use crate::commands::client::{is_fatal_transport_error, with_client};
 use crate::error::{FlipperError, Result};
+use crate::flipper::diag;
 use crate::flipper::gpio;
 use crate::pb_gpio;
-use crate::state::AppState;
+use crate::state::{AppState, ConnectionMode};
 
 // Re-export the snapshot types so the frontend's generated bindings (and
 // `tauri::generate_handler!`) can find them through the commands module.
 pub use crate::flipper::gpio::{GpioPinSnapshot, GpioSnapshot};
+
+const MIN_PULSE_DURATION_MS: u32 = 1;
+const MAX_PULSE_DURATION_MS: u32 = 5_000;
 
 /// Map a user-supplied pin name (`"PC0"`, `"PA7"`, …) to the proto enum.
 /// Case-insensitive: the canonical names are uppercase, but accept any case so
@@ -47,6 +52,72 @@ fn parse_pull(s: &str) -> Result<pb_gpio::GpioInputPull> {
         _ => Err(FlipperError::Session(format!(
             "Invalid GPIO pull '{s}': expected 'no', 'up', or 'down'"
         ))),
+    }
+}
+
+/// GPIO writes are digital at the Tauri boundary. Do not silently forward an
+/// arbitrary `u8` to the firmware's wider `uint32` field.
+fn parse_output_value(value: u8) -> Result<u32> {
+    match value {
+        0 | 1 => Ok(u32::from(value)),
+        _ => Err(FlipperError::Session(format!(
+            "Invalid GPIO value '{value}': expected 0 or 1"
+        ))),
+    }
+}
+
+fn parse_pulse_duration(duration_ms: u32) -> Result<Duration> {
+    if !(MIN_PULSE_DURATION_MS..=MAX_PULSE_DURATION_MS).contains(&duration_ms) {
+        return Err(FlipperError::Session(format!(
+            "Invalid GPIO pulse duration '{duration_ms} ms': expected {MIN_PULSE_DURATION_MS}–{MAX_PULSE_DURATION_MS} ms"
+        )));
+    }
+    Ok(Duration::from_millis(u64::from(duration_ms)))
+}
+
+fn pulse_failure_requires_disconnect(failure: &gpio::GpioPulseFailure) -> bool {
+    failure.pin_state == gpio::GpioPulsePinState::Indeterminate
+        || is_fatal_transport_error(&failure.primary_error)
+        || failure.low_errors.iter().any(is_fatal_transport_error)
+}
+
+fn pulse_failure_message(pin: pb_gpio::GpioPin, failure: &gpio::GpioPulseFailure) -> String {
+    let pin = pin.as_str_name();
+    let low_errors = failure
+        .low_errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    match (failure.phase, failure.pin_state) {
+        (gpio::GpioPulsePhase::Preflight, _) => {
+            format!("GPIO pulse preflight for {pin} failed: {}", failure.primary_error)
+        }
+        (gpio::GpioPulsePhase::DriveHigh, gpio::GpioPulsePinState::LowConfirmed) => {
+            let cleanup = if low_errors.is_empty() {
+                "LOW cleanup was confirmed".to_string()
+            } else {
+                format!("the initial LOW cleanup failed ({low_errors}), but a LOW retry was confirmed")
+            };
+            format!(
+                "GPIO pulse on {pin} failed while driving HIGH, but {cleanup}: {}",
+                failure.primary_error
+            )
+        }
+        (gpio::GpioPulsePhase::DriveLow, gpio::GpioPulsePinState::LowConfirmed) => format!(
+            "GPIO pulse on {pin} encountered an error while driving LOW, but an idempotent LOW retry was confirmed: {}",
+            failure.primary_error
+        ),
+        (_, gpio::GpioPulsePinState::Indeterminate) => format!(
+            "GPIO pulse on {pin} failed and LOW could not be confirmed; pin state is indeterminate. Primary error: {}. LOW errors: {low_errors}",
+            failure.primary_error
+        ),
+        // The only Unchanged failure is currently preflight. Keep a defensive
+        // fallback so a future sequence phase still produces useful context.
+        (_, gpio::GpioPulsePinState::Unchanged) => {
+            format!("GPIO pulse on {pin} failed before changing the pin: {}", failure.primary_error)
+        }
     }
 }
 
@@ -137,10 +208,76 @@ pub async fn gpio_write_pin(pin: String, value: u8, state: State<'_, AppState>) 
 
     tauri::async_runtime::spawn_blocking(move || {
         let pin = parse_pin(&pin)?;
-        let value = u32::from(value);
+        let value = parse_output_value(value)?;
         with_client(&mode_mutex, &client_mutex, |c| {
             gpio::write_pin(c, pin, value)
         })
+    })
+    .await
+    .map_err(|e| FlipperError::Internal(e.to_string()))?
+}
+
+/// Pulse one output pin HIGH and then LOW while retaining exclusive access to
+/// the connected client for the complete sequence. A normal app disconnect or
+/// component unmount therefore cannot interrupt the cleanup write.
+#[tauri::command]
+pub async fn gpio_pulse_pin(
+    pin: String,
+    duration_ms: u32,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<()> {
+    let client_mutex = Arc::clone(&state.client);
+    let mode_mutex = Arc::clone(&state.mode);
+    let ble_cancel_tx = Arc::clone(&state.ble_cancel_tx);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let pin = parse_pin(&pin)?;
+        let duration = parse_pulse_duration(duration_ms)?;
+
+        {
+            let mode = mode_mutex
+                .lock()
+                .map_err(|_| FlipperError::Internal("Connection mode lock poisoned".into()))?;
+            if *mode == ConnectionMode::Cli {
+                return Err(FlipperError::CliModeActive);
+            }
+        }
+
+        let mut client_guard = client_mutex
+            .lock()
+            .map_err(|_| FlipperError::Internal("Client lock poisoned".into()))?;
+        let client = client_guard.as_mut().ok_or(FlipperError::NotConnected)?;
+        let failure = match gpio::pulse_pin(client, pin, duration) {
+            Ok(()) => return Ok(()),
+            Err(failure) => failure,
+        };
+
+        let reason = pulse_failure_message(pin, &failure);
+        let disconnect = pulse_failure_requires_disconnect(&failure);
+        diag::log_event("GpioPulseFailed", reason.clone());
+
+        // Clear the client before releasing its lock. No RPC can slip in
+        // between an indeterminate/fatal pulse result and teardown.
+        if disconnect {
+            *client_guard = None;
+        }
+        drop(client_guard);
+
+        if disconnect {
+            tracing::warn!("tearing down connection after GPIO pulse failure: {reason}");
+            diag::log_event("GpioPulseConnectionTornDown", reason.clone());
+            if let Ok(mut tx_guard) = ble_cancel_tx.lock() {
+                if let Some(tx) = tx_guard.take() {
+                    let _ = tx.send(());
+                }
+            }
+            let _ = app.emit("flipper-disconnected", &reason);
+        } else {
+            tracing::warn!("GPIO pulse failed with connection retained: {reason}");
+        }
+
+        Err(FlipperError::Session(reason))
     })
     .await
     .map_err(|e| FlipperError::Internal(e.to_string()))?
@@ -212,5 +349,84 @@ mod tests {
         assert_eq!(parse_pull("UP").unwrap(), pb_gpio::GpioInputPull::Up);
         assert_eq!(parse_pull("Down").unwrap(), pb_gpio::GpioInputPull::Down);
         assert!(parse_pull("sideways").is_err());
+    }
+
+    #[test]
+    fn parse_output_value_accepts_only_binary_values() {
+        assert_eq!(parse_output_value(0).unwrap(), 0);
+        assert_eq!(parse_output_value(1).unwrap(), 1);
+        assert!(parse_output_value(2).is_err());
+        assert!(parse_output_value(u8::MAX).is_err());
+    }
+
+    #[test]
+    fn parse_pulse_duration_accepts_inclusive_bounds() {
+        assert_eq!(
+            parse_pulse_duration(MIN_PULSE_DURATION_MS).unwrap(),
+            Duration::from_millis(u64::from(MIN_PULSE_DURATION_MS))
+        );
+        assert_eq!(
+            parse_pulse_duration(MAX_PULSE_DURATION_MS).unwrap(),
+            Duration::from_millis(u64::from(MAX_PULSE_DURATION_MS))
+        );
+    }
+
+    #[test]
+    fn parse_pulse_duration_rejects_values_outside_bounds() {
+        assert!(parse_pulse_duration(MIN_PULSE_DURATION_MS - 1).is_err());
+        assert!(parse_pulse_duration(MAX_PULSE_DURATION_MS + 1).is_err());
+    }
+
+    fn pulse_failure(
+        pin_state: gpio::GpioPulsePinState,
+        primary_error: FlipperError,
+    ) -> gpio::GpioPulseFailure {
+        gpio::GpioPulseFailure {
+            phase: gpio::GpioPulsePhase::DriveLow,
+            pin_state,
+            primary_error,
+            low_errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn indeterminate_pin_state_always_requires_disconnect() {
+        let failure = pulse_failure(
+            gpio::GpioPulsePinState::Indeterminate,
+            FlipperError::Timeout,
+        );
+        assert!(pulse_failure_requires_disconnect(&failure));
+    }
+
+    #[test]
+    fn confirmed_low_with_transient_error_retains_connection() {
+        let failure = pulse_failure(gpio::GpioPulsePinState::LowConfirmed, FlipperError::Timeout);
+        assert!(!pulse_failure_requires_disconnect(&failure));
+    }
+
+    #[test]
+    fn fatal_transport_error_requires_disconnect_even_when_low_is_confirmed() {
+        let failure = pulse_failure(
+            gpio::GpioPulsePinState::LowConfirmed,
+            FlipperError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "transport closed",
+            )),
+        );
+        assert!(pulse_failure_requires_disconnect(&failure));
+    }
+
+    #[test]
+    fn indeterminate_message_identifies_pin_and_unknown_state() {
+        let mut failure = pulse_failure(
+            gpio::GpioPulsePinState::Indeterminate,
+            FlipperError::Timeout,
+        );
+        failure.low_errors.push(FlipperError::Timeout);
+
+        let message = pulse_failure_message(pb_gpio::GpioPin::Pa7, &failure);
+        assert!(message.contains("PA7"));
+        assert!(message.contains("LOW could not be confirmed"));
+        assert!(message.contains("pin state is indeterminate"));
     }
 }

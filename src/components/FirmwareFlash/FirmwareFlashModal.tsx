@@ -20,8 +20,8 @@ import {
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useFlipperStore } from "../../store/useFlipperStore";
-import { cancelTransfer } from "../../lib/tauri";
 import {
+  cancelFirmwareFlash,
   firmwareFetchDirectory,
   firmwareFlash,
   firmwareProviders,
@@ -65,11 +65,12 @@ export function FirmwareFlashModal({ onClose }: Props) {
   const [sourceMode, setSourceMode] = useState<"online" | "local">("online");
   const [localFile, setLocalFile] = useState<{ path: string; name: string } | null>(null);
 
-  const [verify, setVerify] = useState(true);
   const [clean, setClean] = useState(true);
   const [showChangelog, setShowChangelog] = useState(false);
 
   const [phase, setPhase] = useState<Phase>("idle");
+  const [cancelPending, setCancelPending] = useState(false);
+  const [cancelSettled, setCancelSettled] = useState<"cancelled" | "too_late" | null>(null);
   const [log, setLog] = useState<LogLine[]>([]);
   const [progress, setProgress] = useState<{ stage: FlashStage; pct: number | null }>({
     stage: "download",
@@ -197,23 +198,25 @@ export function FirmwareFlashModal({ onClose }: Props) {
     let source: FlashSource;
     if (isLocal) {
       if (!localFile) return;
-      source = { kind: "local", local_path: localFile.path, label: localFile.name };
+      source = { kind: "local", local_path: localFile.path };
     } else {
       if (!version) return;
-      const providerName =
-        providers.find((p) => p.id === providerId)?.name ?? providerId;
       source = {
         kind: "remote",
-        url: version.url,
-        sha256: version.sha256,
-        label: `${providerName} · ${channel?.title ?? channelId} ${version.version}`,
+        provider_id: providerId,
+        channel_id: channelId,
+        version: version.version,
+        timestamp: version.timestamp,
+        selection_token: version.selection_token,
       };
     }
     setPhase("running");
+    setCancelPending(false);
+    setCancelSettled(null);
     setLog([]);
     setProgress({ stage: "download", pct: 0 });
     try {
-      await firmwareFlash(source, { verify, clean });
+      await firmwareFlash(source, { clean });
       setPhase("done");
       // The device rebooted into its own updater — the RPC link is gone.
       setConnected(null);
@@ -236,18 +239,45 @@ export function FirmwareFlashModal({ onClose }: Props) {
     isLocal,
     localFile,
     version,
-    providers,
     providerId,
-    channel,
     channelId,
-    verify,
     clean,
     setConnected,
   ]);
 
-  const handleCancel = useCallback(() => {
-    void cancelTransfer().catch(() => {});
-  }, []);
+  const handleCancel = useCallback(async () => {
+    if (cancelPending || cancelSettled !== null) return;
+    setCancelPending(true);
+    try {
+      const response = await cancelFirmwareFlash();
+      setLog((prev) => [
+        ...prev,
+        {
+          id: logIdRef.current++,
+          ts: Date.now(),
+          stage: response.status === "too_late" ? "install" : progress.stage,
+          level: response.status === "too_late" ? "warn" : "info",
+          message: response.message,
+        },
+      ]);
+      if (response.status === "cancelled" || response.status === "too_late") {
+        setCancelSettled(response.status);
+      }
+    } catch (error) {
+      setLog((prev) => [
+        ...prev,
+        {
+          id: logIdRef.current++,
+          ts: Date.now(),
+          stage: "error",
+          level: "error",
+          message: error instanceof Error ? error.message : String(error),
+        },
+      ]);
+    } finally {
+      setCancelPending(false);
+    }
+  }, [cancelPending, cancelSettled, progress.stage]);
 
   return (
     <div
@@ -402,17 +432,17 @@ export function FirmwareFlashModal({ onClose }: Props) {
 
             <div className="flex flex-col gap-1.5">
               <CheckRow
-                label="Verify checksum"
-                checked={verify}
-                disabled={running}
-                onToggle={() => setVerify((v) => !v)}
-              />
-              <CheckRow
                 label="Clean update dir"
                 checked={clean}
                 disabled={running}
                 onToggle={() => setClean((v) => !v)}
               />
+              <div className="flex items-start gap-1.5 px-1 text-[10px] leading-relaxed text-dim">
+                <ShieldCheck size={11} className="mt-0.5 shrink-0 text-success" />
+                {isLocal
+                  ? "Local bundles are treated as untrusted and validated before upload."
+                  : "Online bundles are re-resolved and checksum-verified by the backend."}
+              </div>
             </div>
 
             {!isLocal && version?.changelog && (
@@ -505,10 +535,17 @@ export function FirmwareFlashModal({ onClose }: Props) {
 
             {running ? (
               <button
-                onClick={handleCancel}
-                className="px-3 py-1.5 text-xs rounded bg-surface text-secondary hover:text-primary hover:bg-elevated"
+                onClick={() => void handleCancel()}
+                disabled={cancelPending || cancelSettled !== null}
+                className="px-3 py-1.5 text-xs rounded bg-surface text-secondary hover:text-primary hover:bg-elevated disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                Cancel
+                {cancelPending
+                  ? "Cancelling…"
+                  : cancelSettled === "too_late"
+                    ? "Too late to cancel"
+                    : cancelSettled === "cancelled"
+                      ? "Cancel requested"
+                      : "Cancel"}
               </button>
             ) : (
               <button
@@ -540,7 +577,7 @@ const STAGE_LABEL: Record<FlashStage, string> = {
   upload: "Uploading",
   install: "Staging update",
   reboot: "Rebooting",
-  done: "Complete",
+  done: "Updater started",
   error: "Failed",
 };
 
@@ -551,7 +588,7 @@ function StageBadge({ phase, stage }: { phase: Phase; stage: FlashStage }) {
   if (phase === "done") {
     return (
       <span className="inline-flex items-center gap-1 text-[11px] text-success w-32 shrink-0">
-        <CheckCircle2 size={13} /> Update applied
+        <CheckCircle2 size={13} /> Update staged
       </span>
     );
   }

@@ -169,6 +169,30 @@ export const storageDelete = async (path: string, recursive: boolean): Promise<v
   return invoke<void>("storage_delete", { path, recursive });
 };
 
+export interface StorageDeleteManyTarget {
+  path: string;
+  recursive: boolean;
+}
+
+export interface StorageDeleteManyFailure extends StorageDeleteManyTarget {
+  error: string;
+  fatal: boolean;
+}
+
+export interface StorageDeleteManyResult {
+  deleted: StorageDeleteManyTarget[];
+  failed: StorageDeleteManyFailure[];
+  unattempted: StorageDeleteManyTarget[];
+  stopped_reason: string | null;
+}
+
+export const storageDeleteMany = async (
+  targets: StorageDeleteManyTarget[],
+): Promise<StorageDeleteManyResult> => {
+  await awaitCliCleanup();
+  return invoke<StorageDeleteManyResult>("storage_delete_many", { targets });
+};
+
 export const storageRename = async (oldPath: string, newPath: string): Promise<void> => {
   await awaitCliCleanup();
   return invoke<void>("storage_rename", { old_path: oldPath, new_path: newPath });
@@ -243,6 +267,10 @@ export const cliStart = (): Promise<void> =>
 /** Send a text command to the Flipper CLI. */
 export const cliSend = (input: string): Promise<void> =>
   invoke<void>("cli_send", { input });
+
+/** Send the terminal Ctrl+C / ETX byte to interrupt the running CLI command. */
+export const cliInterrupt = (): Promise<void> =>
+  invoke<void>("cli_interrupt");
 
 /** Leave CLI mode and re-enter RPC mode. */
 export const cliStop = (): Promise<void> =>
@@ -548,6 +576,18 @@ export const gpioWritePin = async (
 ): Promise<void> => {
   await awaitCliCleanup();
   return invoke<void>("gpio_write_pin", { pin, value });
+};
+
+/**
+ * Drive an output pin HIGH for a bounded duration, then LOW. The backend owns
+ * the complete sequence so component teardown cannot skip the cleanup write.
+ */
+export const gpioPulsePin = async (
+  pin: GpioPinName,
+  durationMs: number,
+): Promise<void> => {
+  await awaitCliCleanup();
+  return invoke<void>("gpio_pulse_pin", { pin, durationMs });
 };
 
 export const gpioGetOtg = async (): Promise<boolean> => {

@@ -1,5 +1,11 @@
 @import "tailwindcss";
 
+.terminal-font {
+  font-family:
+    ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono",
+    "Noto Sans Mono", "Apple Symbols", monospace;
+}
+
 /* ── Theme tokens ────────────────────────────────────────────────────────── */
 /* Tailwind v4 @theme — these become utility classes:                        */
 /*   bg-panel, text-primary, border-flipper, text-accent, etc.               */

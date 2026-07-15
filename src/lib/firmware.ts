@@ -19,9 +19,8 @@ export interface FirmwareVersion {
   changelog: string;
   /** Unix epoch seconds; 0 when the source omits it. */
   timestamp: number;
-  url: string;
-  /** Expected SHA-256 (hex), empty when the source omits it. */
-  sha256: string;
+  /** Opaque backend binding to the exact catalog entry. */
+  selection_token: string;
 }
 
 export interface FirmwareChannel {
@@ -39,12 +38,17 @@ export interface FirmwareCatalog {
 /** Where a flash pulls its bundle from. Keys are snake_case to match the
  * backend's `FlashSource` (Tauri commands here use snake_case argument keys). */
 export type FlashSource =
-  | { kind: "remote"; url: string; sha256: string; label: string }
-  | { kind: "local"; local_path: string; label: string };
+  | {
+      kind: "remote";
+      provider_id: string;
+      channel_id: string;
+      version: string;
+      timestamp: number;
+      selection_token: string;
+    }
+  | { kind: "local"; local_path: string };
 
 export interface FlashOptions {
-  /** Verify the download against the source SHA-256 when available. */
-  verify: boolean;
   /** Wipe any existing bundle dir under /ext/update before uploading. */
   clean: boolean;
 }
@@ -69,6 +73,16 @@ export interface FlashProgress {
   level: FlashLevel;
 }
 
+export type FirmwareCancelStatus =
+  | "cancelled"
+  | "too_late"
+  | "no_active_operation";
+
+export interface FirmwareCancelResponse {
+  status: FirmwareCancelStatus;
+  message: string;
+}
+
 /** The selectable firmware sources, in display order. */
 export const firmwareProviders = (): Promise<FirmwareProvider[]> =>
   invoke<FirmwareProvider[]>("firmware_providers");
@@ -88,6 +102,10 @@ export const firmwareFlash = (
   source: FlashSource,
   options: FlashOptions,
 ): Promise<void> => invoke<void>("firmware_flash", { source, options });
+
+/** Cancel the active firmware operation without affecting file transfers. */
+export const cancelFirmwareFlash = (): Promise<FirmwareCancelResponse> =>
+  invoke<FirmwareCancelResponse>("cancel_firmware_flash");
 
 /** Subscribe to flash-progress events. Returns the unlisten fn. */
 export const onFlashProgress = (

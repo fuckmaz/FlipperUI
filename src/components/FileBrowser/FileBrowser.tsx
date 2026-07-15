@@ -12,6 +12,7 @@ import { Upload } from "lucide-react";
 export function FileBrowser() {
   const currentPath = useFlipperStore((s) => s.currentPath);
   const transferProgress = useFlipperStore((s) => s.transferProgress);
+  const isDeleting = useFlipperStore((s) => s.fileBrowserDeleting);
   const { refresh, uploadFile } = useStorage();
   const [isDragOver, setIsDragOver] = useState(false);
   // Folder under the cursor during a drag, so we can highlight it and route
@@ -50,6 +51,13 @@ export function FileBrowser() {
 
   // Listen for native file drag-and-drop events
   useEffect(() => {
+    if (isDeleting) {
+      setIsDragOver(false);
+      setHoveredFolder(null);
+    }
+  }, [isDeleting]);
+
+  useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
 
@@ -64,6 +72,11 @@ export function FileBrowser() {
     getCurrentWebviewWindow()
       .onDragDropEvent((event) => {
         if (cancelled) return;
+        if (isDeleting) {
+          setIsDragOver(false);
+          setHoveredFolder(null);
+          return;
+        }
         if (event.payload.type === "enter") {
           dprRef.current = window.devicePixelRatio || 1;
           setIsDragOver(true);
@@ -94,7 +107,7 @@ export function FileBrowser() {
       cancelled = true;
       unlisten?.();
     };
-  }, [uploadFile]);
+  }, [isDeleting, uploadFile]);
 
   return (
     <div className="flex flex-col h-full relative">
@@ -108,7 +121,7 @@ export function FileBrowser() {
       {/* Drag-and-drop overlay. Stays semi-transparent so the user can still
           see (and aim at) the folder rows underneath. `pointer-events-none`
           keeps the OS drag flowing through to elementFromPoint hit-testing. */}
-      {isDragOver && (
+      {isDragOver && !isDeleting && (
         <div className="absolute inset-0 z-40 flex items-end justify-center pb-6 bg-app/30 pointer-events-none">
           <div className="flex flex-col items-center gap-1 px-5 py-3 border-2 border-dashed border-accent/60 bg-panel/90 rounded-xl shadow-xl">
             <div className="flex items-center gap-2 text-accent">

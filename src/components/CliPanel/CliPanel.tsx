@@ -2,7 +2,7 @@ import { useRef, useState, useEffect, useMemo } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { Terminal as TerminalIcon } from "lucide-react";
 import { useFlipperStore } from "../../store/useFlipperStore";
-import { cliStart, cliSend, cliStop } from "../../lib/tauri";
+import { cliStart, cliSend, cliInterrupt, cliStop } from "../../lib/tauri";
 
 // Module-level promise tracking the in-flight CLI->RPC handover so RPC calls
 // (file browser, etc.) wait for it to finish instead of racing the mode switch.
@@ -123,8 +123,24 @@ export function CliPanel() {
     }
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter") {
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "c") {
+      const inputElement = e.currentTarget;
+      const inputSelection =
+        inputElement.selectionStart !== inputElement.selectionEnd;
+      const documentSelection = Boolean(window.getSelection()?.toString());
+
+      // Keep the platform's normal copy behavior when the user selected text.
+      // With no selection, Ctrl+C has its terminal meaning: send ETX.
+      if (inputSelection || documentSelection || !cliConnected) return;
+
+      e.preventDefault();
+      setInput("");
+      setHistoryIdx(-1);
+      void cliInterrupt().catch((err) => {
+        addCliLine({ type: "error", text: `Failed to interrupt CLI: ${err}` });
+      });
+    } else if (e.key === "Enter") {
       handleSubmit();
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
@@ -165,7 +181,7 @@ export function CliPanel() {
       {/* Output */}
       <div
         ref={scrollRef}
-        className="flex-1 overflow-y-auto px-3 py-1.5 font-mono text-xs leading-relaxed whitespace-pre-wrap break-all select-text cursor-text"
+        className="terminal-font flex-1 overflow-y-auto px-3 py-1.5 text-xs leading-relaxed whitespace-pre-wrap break-all select-text cursor-text"
         onClick={() => inputRef.current?.focus()}
       >
         {visibleHistory.map((line) => (
@@ -182,13 +198,13 @@ export function CliPanel() {
 
       {/* Input */}
       <div className="flex items-center gap-1.5 px-3 py-1.5 border-t border-border-subtle">
-        <span className="text-xs text-accent font-mono shrink-0">&gt;</span>
+        <span className="terminal-font text-xs text-accent shrink-0">&gt;</span>
         <input
           ref={inputRef}
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          className={`flex-1 bg-transparent text-xs font-mono outline-none placeholder:text-dim transition-opacity ${
+          className={`terminal-font flex-1 bg-transparent text-xs outline-none placeholder:text-dim transition-opacity ${
             cliConnected ? "text-primary" : "text-dim opacity-40"
           }`}
           placeholder={cliConnected ? "" : "connecting..."}

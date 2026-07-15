@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -5,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
-use crate::commands::client::with_client;
+use crate::commands::client::{is_fatal_transport_error, with_client};
 use crate::commands::path::validate_path;
 use crate::error::{FlipperError, Result};
 use crate::flipper::client::FlipperClient;
@@ -344,6 +345,191 @@ pub async fn storage_delete(
     .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
+const MAX_DELETE_BATCH_ITEMS: usize = 1_000;
+
+/// One validated delete operation submitted by the file browser.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StorageDeleteTarget {
+    pub path: String,
+    pub recursive: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct StorageDeleteFailure {
+    pub path: String,
+    pub recursive: bool,
+    pub error: String,
+    /// True when the transport was torn down and no later item was attempted.
+    pub fatal: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct StorageDeleteManyResult {
+    pub deleted: Vec<StorageDeleteTarget>,
+    pub failed: Vec<StorageDeleteFailure>,
+    pub unattempted: Vec<StorageDeleteTarget>,
+    pub stopped_reason: Option<String>,
+}
+
+/// Validate the complete batch before acquiring the client or issuing any RPC.
+/// This prevents a malformed later target from being discovered only after
+/// earlier entries have already been removed.
+fn validate_destructive_path(path: &str) -> Result<()> {
+    validate_path(path)?;
+
+    // Destructive operations deliberately use a stricter grammar than normal
+    // storage reads. Empty or dot components can spell a storage root (for
+    // example `/ext/`, `/ext/.`, or `/ext//`) or create ambiguous aliases for
+    // another target. Require a root plus at least one ordinary child segment.
+    let mut components = path.split('/');
+    if components.next() != Some("") {
+        return Err(FlipperError::Session("Delete path must be absolute".into()));
+    }
+    let components: Vec<&str> = components.collect();
+    if components.len() < 2 {
+        return Err(FlipperError::Session(
+            "Deleting a storage root is not allowed".into(),
+        ));
+    }
+    if components.iter().any(|component| component.is_empty()) {
+        return Err(FlipperError::Session(
+            "Delete path cannot contain empty components".into(),
+        ));
+    }
+    if components.contains(&".") {
+        return Err(FlipperError::Session(
+            "Delete path cannot contain dot components".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_delete_many_targets(targets: &[StorageDeleteTarget]) -> Result<()> {
+    if targets.is_empty() {
+        return Err(FlipperError::Session(
+            "Delete batch must contain at least one item".into(),
+        ));
+    }
+    if targets.len() > MAX_DELETE_BATCH_ITEMS {
+        return Err(FlipperError::Session(format!(
+            "Delete batch exceeds the {MAX_DELETE_BATCH_ITEMS}-item limit"
+        )));
+    }
+
+    let mut unique_paths = HashSet::with_capacity(targets.len());
+    for target in targets {
+        validate_destructive_path(&target.path)?;
+        if !unique_paths.insert(target.path.as_str()) {
+            return Err(FlipperError::Session(format!(
+                "Delete batch contains duplicate path: {}",
+                target.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Execute a pre-validated batch sequentially. The caller owns the client lock
+/// for this entire function. Protocol-level failures are recorded and the next
+/// item is attempted; fatal transport/framing failures stop the batch and mark
+/// every later target as unattempted.
+fn execute_delete_many(
+    targets: Vec<StorageDeleteTarget>,
+    mut delete: impl FnMut(&StorageDeleteTarget) -> Result<()>,
+) -> StorageDeleteManyResult {
+    let mut result = StorageDeleteManyResult {
+        deleted: Vec::with_capacity(targets.len()),
+        failed: Vec::new(),
+        unattempted: Vec::new(),
+        stopped_reason: None,
+    };
+
+    let mut targets = targets.into_iter();
+    while let Some(target) = targets.next() {
+        match delete(&target) {
+            Ok(()) => result.deleted.push(target),
+            Err(error) => {
+                let fatal = is_fatal_transport_error(&error);
+                let error = error.to_string();
+                result.failed.push(StorageDeleteFailure {
+                    path: target.path,
+                    recursive: target.recursive,
+                    error: error.clone(),
+                    fatal,
+                });
+                if fatal {
+                    result.stopped_reason = Some(error);
+                    result.unattempted.extend(targets);
+                    break;
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Delete a confirmed file-browser batch under one client lock.
+///
+/// All paths are validated before the lock/RPC phase. If a fatal wire error
+/// occurs, the current item is reported as failed, later items are explicitly
+/// unattempted, and the connection is torn down using the same BLE cancellation
+/// and frontend disconnect event semantics as other fatal transfer commands.
+#[tauri::command]
+pub async fn storage_delete_many(
+    targets: Vec<StorageDeleteTarget>,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<StorageDeleteManyResult> {
+    validate_delete_many_targets(&targets)?;
+
+    let client_mutex = Arc::clone(&state.client);
+    let mode_mutex = Arc::clone(&state.mode);
+    let ble_cancel_tx = Arc::clone(&state.ble_cancel_tx);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        {
+            let mode = mode_mutex
+                .lock()
+                .map_err(|_| FlipperError::Internal("Connection mode lock poisoned".into()))?;
+            if *mode == ConnectionMode::Cli {
+                return Err(FlipperError::CliModeActive);
+            }
+        }
+
+        let mut client_guard = client_mutex
+            .lock()
+            .map_err(|_| FlipperError::Internal("Client lock poisoned".into()))?;
+        let client = client_guard.as_mut().ok_or(FlipperError::NotConnected)?;
+        let result = execute_delete_many(targets, |target| {
+            storage::storage_delete(client, &target.path, target.recursive)
+        });
+
+        let fatal_reason = result.stopped_reason.clone();
+        if fatal_reason.is_some() {
+            // Clear the client while this batch still owns the lock so no RPC
+            // can slip in between the fatal error and connection teardown.
+            *client_guard = None;
+        }
+        drop(client_guard);
+
+        if let Some(reason) = fatal_reason {
+            tracing::warn!("tearing down connection after delete batch failure: {reason}");
+            diag::log_event("DeleteBatchConnectionTornDown", reason.clone());
+            if let Ok(mut tx_guard) = ble_cancel_tx.lock() {
+                if let Some(tx) = tx_guard.take() {
+                    let _ = tx.send(());
+                }
+            }
+            let _ = app.emit("flipper-disconnected", &reason);
+        }
+
+        Ok(result)
+    })
+    .await
+    .map_err(|e| FlipperError::Internal(e.to_string()))?
+}
+
 /// Rename (or move) a file/directory on the Flipper.
 /// Both `old_path` and `new_path` must be absolute paths on the same storage.
 #[tauri::command(rename_all = "snake_case")]
@@ -589,4 +775,99 @@ pub async fn storage_tar_extract(
     })
     .await
     .map_err(|e| FlipperError::Internal(e.to_string()))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(path: &str) -> StorageDeleteTarget {
+        StorageDeleteTarget {
+            path: path.to_string(),
+            recursive: false,
+        }
+    }
+
+    #[test]
+    fn delete_batch_validation_rejects_every_invalid_batch_before_execution() {
+        assert!(validate_delete_many_targets(&[]).is_err());
+        for invalid_path in [
+            "/ext",
+            "/ext/",
+            "/ext/.",
+            "/ext//",
+            "/int",
+            "/int/.",
+            "/int//folder",
+            "/any",
+            "/any//",
+            "/any/./folder",
+            "/ext/folder/",
+            "/ext/folder//child",
+            "/ext/../int/secret",
+        ] {
+            assert!(
+                validate_delete_many_targets(&[target(invalid_path)]).is_err(),
+                "should reject destructive path {invalid_path}"
+            );
+        }
+        assert!(validate_delete_many_targets(&[target("/ext/a"), target("/ext/a"),]).is_err());
+
+        assert!(validate_delete_many_targets(&[
+            target("/ext/a"),
+            StorageDeleteTarget {
+                path: "/int/folder".into(),
+                recursive: true,
+            },
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn delete_batch_continues_after_non_fatal_item_failure() {
+        let targets = vec![target("/ext/a"), target("/ext/b"), target("/ext/c")];
+        let mut attempted = Vec::new();
+        let result = execute_delete_many(targets, |item| {
+            attempted.push(item.path.clone());
+            if item.path == "/ext/b" {
+                Err(FlipperError::Session("permission denied".into()))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(attempted, ["/ext/a", "/ext/b", "/ext/c"]);
+        assert_eq!(result.deleted, [target("/ext/a"), target("/ext/c")]);
+        assert_eq!(result.failed.len(), 1);
+        assert!(!result.failed[0].fatal);
+        assert!(result.unattempted.is_empty());
+        assert!(result.stopped_reason.is_none());
+    }
+
+    #[test]
+    fn delete_batch_stops_and_accounts_for_later_items_after_fatal_failure() {
+        let targets = vec![target("/ext/a"), target("/ext/b"), target("/ext/c")];
+        let mut attempted = Vec::new();
+        let result = execute_delete_many(targets, |item| {
+            attempted.push(item.path.clone());
+            if item.path == "/ext/b" {
+                Err(FlipperError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "device disconnected",
+                )))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(attempted, ["/ext/a", "/ext/b"]);
+        assert_eq!(result.deleted, [target("/ext/a")]);
+        assert_eq!(result.failed.len(), 1);
+        assert!(result.failed[0].fatal);
+        assert_eq!(result.unattempted, [target("/ext/c")]);
+        assert!(result
+            .stopped_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("device disconnected")));
+    }
 }

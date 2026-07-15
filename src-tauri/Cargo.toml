@@ -42,6 +42,7 @@ uuid = "1"
 # second async runtime. `flate2`+`tar` unpack the gzip'd `.tgz` update bundle;
 # `sha2` verifies the download against the directory.json checksum.
 ureq = { version = "2", features = ["tls"] }
+url = "2"
 flate2 = "1"
 tar = "0.4"
 sha2 = "0.10"

@@ -5,6 +5,10 @@
 /** Pin direction. Backed by the `GpioPinMode` proto enum on the device. */
 export type GpioMode = "input" | "output";
 
+/** Mode observed without changing the pin. `other` means the pin is currently
+ * in an alternate/analog firmware mode that the GPIO RPC API cannot describe. */
+export type GpioObservedMode = GpioMode | "other";
+
 /** Internal pull resistor configuration for an input pin. Frontend-only state —
  * firmware does not expose `GetInputPull`, so we track the last value we set. */
 export type GpioPull = "no" | "up" | "down";
@@ -32,11 +36,12 @@ export const RPC_GPIO_PINS: readonly GpioPinName[] = [
   "PA7",
 ] as const;
 
-/** Per-pin state from `gpio_snapshot()` — mode and last-read logic level. */
+/** Per-pin state from `gpio_snapshot()`. Output and alternate-mode pins have
+ * no readable level because the firmware only permits reads in INPUT mode. */
 export interface GpioPinState {
   pin: GpioPinName;
-  mode: GpioMode;
-  value: 0 | 1;
+  mode: GpioObservedMode;
+  value: 0 | 1 | null;
 }
 
 /** Full snapshot returned by `gpio_snapshot()`. */

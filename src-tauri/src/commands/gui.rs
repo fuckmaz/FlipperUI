@@ -134,6 +134,7 @@ pub async fn send_input_event(key: i32, input_type: i32, state: State<'_, AppSta
 #[tauri::command]
 pub async fn screen_stream_stop(state: State<'_, AppState>) -> Result<()> {
     let client_mutex = Arc::clone(&state.client);
+    let mode_mutex = Arc::clone(&state.mode);
     let screen_stream_active = Arc::clone(&state.screen_stream_active);
     let input_event_tx = Arc::clone(&state.input_event_tx);
 
@@ -153,6 +154,14 @@ pub async fn screen_stream_stop(state: State<'_, AppState>) -> Result<()> {
         // mutex before we send the stop command. Now safe because we're on
         // a spawn_blocking thread, not the Tauri main loop.
         std::thread::sleep(Duration::from_millis(150));
+
+        // cli_start marks the mode before quiescing the same reader. If that
+        // transition owns cleanup, sending a protobuf stop request here could
+        // land after the port has already switched to text CLI and appear as a
+        // stray one-character command. Let cli_start drain the stream instead.
+        if *mode_mutex.lock().unwrap() == ConnectionMode::Cli {
+            return Ok(());
+        }
 
         {
             let mut guard = client_mutex.lock().unwrap();

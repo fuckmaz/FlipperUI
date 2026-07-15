@@ -52,7 +52,7 @@ pub fn with_client<T>(
 /// they mean the firmware momentarily fell behind, not that the link is dead.
 /// Treating them as fatal (as past versions did) tore down the connection
 /// mid-transfer on large uploads, so they are deliberately kept transient.
-fn is_fatal_transport_error(e: &FlipperError) -> bool {
+pub(crate) fn is_fatal_transport_error(e: &FlipperError) -> bool {
     match e {
         FlipperError::Serial(_) => true,
         FlipperError::Io(io) => match io.kind() {

@@ -1215,6 +1215,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "url",
  "uuid",
  "windows 0.61.3",
 ]

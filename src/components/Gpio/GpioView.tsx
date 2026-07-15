@@ -7,6 +7,7 @@ import {
 } from "react";
 import { useFlipperStore } from "../../store/useFlipperStore";
 import {
+  gpioPulsePin,
   gpioReadPin,
   gpioSetMode,
   gpioSetOtg,
@@ -18,6 +19,7 @@ import {
   HEADER_PINS,
   RPC_GPIO_PINS,
   type GpioMode,
+  type GpioObservedMode,
   type GpioPinName,
   type GpioPull,
   type HeaderPin,
@@ -34,8 +36,8 @@ const BLE_POLL_FLOOR_MS = 500;
 
 /** Per-pin RPC state mirrored from `gpio_snapshot` and live edits. */
 interface RpcPinUiState {
-  mode: GpioMode;
-  value: 0 | 1;
+  mode: GpioObservedMode;
+  value: 0 | 1 | null;
   /** Frontend-only: last pull value we sent. Defaults to "no". */
   pull: GpioPull;
   /** Whether the user has enabled Watch mode on this pin. */
@@ -52,8 +54,8 @@ const emptyPinMap = (): RpcPinMap =>
     RPC_GPIO_PINS.map((pin) => [
       pin,
       {
-        mode: "input" as GpioMode,
-        value: 0 as 0 | 1,
+        mode: "other" as GpioObservedMode,
+        value: null,
         pull: "no" as GpioPull,
         watching: false,
         lastAction: null,
@@ -134,7 +136,7 @@ export function GpioView() {
           };
           // Seed history with the snapshot value so the sparkline isn't
           // blank on first render.
-          samplesRef.current[p.pin] = [p.value];
+          samplesRef.current[p.pin] = p.value === null ? [] : [p.value];
         }
         return updated;
       });
@@ -262,16 +264,38 @@ export function GpioView() {
       try {
         await gpioSetMode(pin, mode);
         if (!mountedRef.current) return;
+        // Firmware drives a newly configured OUTPUT low. INPUT can be sampled
+        // immediately, but keep it unknown until that read completes.
+        const initialValue: 0 | null = mode === "output" ? 0 : null;
         setPins((prev) => ({
           ...prev,
           [pin]: {
             ...prev[pin],
             mode,
+            value: initialValue,
             // Switching to OUTPUT — turn Watch off; switching to INPUT —
             // leave Watch where the user had it.
             watching: mode === "output" ? false : prev[pin].watching,
           },
         }));
+
+        if (mode === "input") {
+          try {
+            const value = await gpioReadPin(pin);
+            if (!mountedRef.current) return;
+            setPins((prev) => ({
+              ...prev,
+              [pin]: { ...prev[pin], value },
+            }));
+            samplesRef.current[pin] = [value];
+          } catch (e) {
+            if (mountedRef.current) {
+              setError(
+                `Set ${pin} to INPUT, but its initial read failed: ${errMsg(e)}`,
+              );
+            }
+          }
+        }
         markAction(pin, `Set ${mode.toUpperCase()}`);
       } catch (e) {
         if (mountedRef.current) {
@@ -336,12 +360,7 @@ export function GpioView() {
       setBusy(true);
       setError(null);
       try {
-        await gpioWritePin(pin, 1);
-        if (!mountedRef.current) return;
-        setPins((prev) => ({ ...prev, [pin]: { ...prev[pin], value: 1 } }));
-        await new Promise((resolve) => window.setTimeout(resolve, 100));
-        if (!mountedRef.current) return;
-        await gpioWritePin(pin, 0);
+        await gpioPulsePin(pin, 100);
         if (!mountedRef.current) return;
         setPins((prev) => ({ ...prev, [pin]: { ...prev[pin], value: 0 } }));
         markAction(pin, "Pulse 100 ms");
@@ -451,7 +470,10 @@ export function GpioView() {
   // Memoised view-model for the chip strip — keep this above any early
   // returns so the Hook order stays stable when the connection drops.
   const chips = useMemo(() => {
-    const out: Record<string, { mode: GpioMode; value: 0 | 1 } | undefined> = {};
+    const out: Record<
+      string,
+      { mode: GpioObservedMode; value: 0 | 1 | null } | undefined
+    > = {};
     for (const pin of RPC_GPIO_PINS) {
       out[pin] = { mode: pins[pin].mode, value: pins[pin].value };
     }
