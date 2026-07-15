@@ -1,6 +1,6 @@
 [package]
 name = "flipperui"
-version = "0.4.5"
+version = "0.4.6"
 description = "FlipperUI - A Tauri-based Flipper Zero file-manager and Signal-Library"
 authors = ["maz"]
 edition = "2021"
@@ -46,6 +46,7 @@ url = "2"
 flate2 = "1"
 tar = "0.4"
 sha2 = "0.10"
+semver = "1"
 
 # macOS-only: AppKit FFI for setting the Dock icon at runtime.
 # `objc2` is already in the dep tree transitively via Tauri/cocoa, so adding

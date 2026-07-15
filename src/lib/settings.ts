@@ -54,6 +54,14 @@ export interface AppSettings {
      * Manual disconnects via the UI do not emit a notification. */
     deviceDisconnected: boolean;
   };
+  updates: {
+    /** How often FlipperUI checks GitHub Releases for a newer version. */
+    checkFrequency: UpdateCheckFrequency;
+    /** RFC 3339 timestamp of the last successful update check. */
+    lastCheckedAt: string | null;
+    /** Latest release for which an automatic toast was already shown. */
+    lastNotifiedVersion: string | null;
+  };
   appearance: {
     /** Selected app-icon variant id. Resolved server-side: unknown values
      * fall back to "default" without erroring. New variants can be added
@@ -107,6 +115,8 @@ export interface AppSettings {
   };
 }
 
+export type UpdateCheckFrequency = "daily" | "startup" | "manual";
+
 export const DEFAULT_SETTINGS: AppSettings = {
   language: "en",
   subghz: { excludedDirs: [] },
@@ -117,6 +127,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   apps: { excludedDirs: [], extraDirs: [] },
   tray: { enabled: true, hideDockIcon: false, monochromeIcon: false },
   notifications: { libraryScansFinished: true, deviceDisconnected: true },
+  updates: {
+    checkFrequency: "daily",
+    lastCheckedAt: null,
+    lastNotifiedVersion: null,
+  },
   appearance: { appIcon: "default", themeAccent: "#ff8300" },
   screenStream: { screenshotDir: null, gifDir: null },
   connection: {
@@ -164,6 +179,11 @@ export type SettingsPatch = {
   notifications?: {
     libraryScansFinished?: boolean;
     deviceDisconnected?: boolean;
+  };
+  updates?: {
+    checkFrequency?: UpdateCheckFrequency;
+    lastCheckedAt?: string | null;
+    lastNotifiedVersion?: string | null;
   };
   appearance?: {
     appIcon?: string;
@@ -254,6 +274,18 @@ async function updateSettingsNow(patch: SettingsPatch): Promise<AppSettings> {
       deviceDisconnected:
         patch.notifications?.deviceDisconnected ??
         current.notifications.deviceDisconnected,
+    },
+    updates: {
+      checkFrequency:
+        patch.updates?.checkFrequency ?? current.updates.checkFrequency,
+      lastCheckedAt:
+        patch.updates?.lastCheckedAt !== undefined
+          ? patch.updates.lastCheckedAt
+          : current.updates.lastCheckedAt,
+      lastNotifiedVersion:
+        patch.updates?.lastNotifiedVersion !== undefined
+          ? patch.updates.lastNotifiedVersion
+          : current.updates.lastNotifiedVersion,
     },
     appearance: {
       appIcon: patch.appearance?.appIcon ?? current.appearance.appIcon,
@@ -364,6 +396,19 @@ function mergeWithDefaults(raw: Partial<AppSettings>): AppSettings {
         raw.notifications?.deviceDisconnected ??
         DEFAULT_SETTINGS.notifications.deviceDisconnected,
     },
+    updates: {
+      checkFrequency: isUpdateCheckFrequency(raw.updates?.checkFrequency)
+        ? raw.updates.checkFrequency
+        : DEFAULT_SETTINGS.updates.checkFrequency,
+      lastCheckedAt:
+        typeof raw.updates?.lastCheckedAt === "string"
+          ? raw.updates.lastCheckedAt
+          : DEFAULT_SETTINGS.updates.lastCheckedAt,
+      lastNotifiedVersion:
+        typeof raw.updates?.lastNotifiedVersion === "string"
+          ? raw.updates.lastNotifiedVersion
+          : DEFAULT_SETTINGS.updates.lastNotifiedVersion,
+    },
     appearance: {
       appIcon:
         raw.appearance?.appIcon ?? DEFAULT_SETTINGS.appearance.appIcon,
@@ -412,4 +457,10 @@ function mergeWithDefaults(raw: Partial<AppSettings>): AppSettings {
         DEFAULT_SETTINGS.libraries.preScanReview,
     },
   };
+}
+
+function isUpdateCheckFrequency(
+  value: unknown,
+): value is UpdateCheckFrequency {
+  return value === "daily" || value === "startup" || value === "manual";
 }

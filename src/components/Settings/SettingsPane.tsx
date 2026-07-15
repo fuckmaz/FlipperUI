@@ -21,10 +21,19 @@ import {
   Bug,
   MessageSquare,
   Mail,
+  ExternalLink,
+  GitFork,
+  RefreshCw,
 } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { DiagPanel } from "../DevTools/DiagPanel";
-import { loadSettings, subscribeSettings, updateSettings, type AppSettings } from "../../lib/settings";
+import {
+  loadSettings,
+  subscribeSettings,
+  updateSettings,
+  type AppSettings,
+  type UpdateCheckFrequency,
+} from "../../lib/settings";
 import { useDirectorySuggestions } from "../../lib/useDirectorySuggestions";
 import { appIconVariants, setAppIcon, type AppIconVariant } from "../../lib/tauri";
 import {
@@ -34,9 +43,18 @@ import {
   normalizeHex,
 } from "../../lib/theme";
 import { LibraryExclusionsEditor } from "./LibraryExclusionsEditor";
+import {
+  checkForAppUpdate,
+  openLatestAppRelease,
+  useAppUpdateStore,
+  type AppUpdateState,
+} from "../../lib/appUpdates";
 
 const IS_MACOS =
   typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
+
+const REPO_URL = "https://github.com/fuckmaz/FlipperUI";
+const LATEST_RELEASE_URL = `${REPO_URL}/releases/latest`;
 
 const LANGUAGE_OPTIONS = [{ code: "en", label: "English" }];
 
@@ -45,6 +63,7 @@ export function SettingsPane() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [diagOpen, setDiagOpen] = useState(false);
   const [iconVariants, setIconVariants] = useState<AppIconVariant[]>([]);
+  const appUpdate = useAppUpdateStore();
 
   useEffect(() => {
     getVersion().then(setVersion).catch(() => {});
@@ -56,6 +75,18 @@ export function SettingsPane() {
   const onLanguageChange = async (lang: string) => {
     const next = await updateSettings({ language: lang });
     setSettings(next);
+  };
+
+  const onUpdateCheckFrequencyChange = async (
+    checkFrequency: UpdateCheckFrequency,
+  ) => {
+    const next = await updateSettings({ updates: { checkFrequency } });
+    setSettings(next);
+  };
+
+  const handleUpdateAction = () => {
+    if (appUpdate.phase === "available") return openLatestAppRelease();
+    return checkForAppUpdate(true);
   };
 
   const onAppsExtraChange = async (extraDirs: string[]) => {
@@ -217,14 +248,71 @@ export function SettingsPane() {
               <span className="text-primary font-medium">FlipperUI</span>
               <span className="text-secondary">A Flipper Zero Manager and qFlipper replacement, focused on file browsing and organized libraries for SubGHz, Infrared, NFC and everything else.</span>
               <span className="text-dim italic mt-0.5">in love -maz</span>
-              <button
-                onClick={() => openUrl("mailto:maz@postcatz.com")}
-                className="flex items-center gap-1 text-[10px] text-dim hover:text-secondary mt-1 w-fit transition-colors"
-              >
-                <Mail size={9} />
-                send me a mail :)
-              </button>
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1">
+                <button
+                  onClick={() => openUrl("mailto:maz@postcatz.com")}
+                  className="flex items-center gap-1 text-[10px] text-dim hover:text-secondary w-fit transition-colors"
+                >
+                  <Mail size={9} />
+                  send me a mail :)
+                </button>
+                <button
+                  onClick={() => openUrl(LATEST_RELEASE_URL)}
+                  title="Open the latest FlipperUI release on GitHub"
+                  className="flex items-center gap-1 text-[10px] text-dim hover:text-secondary w-fit transition-colors"
+                >
+                  <ExternalLink size={9} />
+                  Latest release
+                </button>
+              </div>
             </div>
+          </div>
+        </Section>
+
+        <Section icon={<RefreshCw size={13} />} title="Application Updates">
+          <Row
+            label="Check for updates"
+            hint="Checks the latest published stable release on GitHub. When a newer version is available, FlipperUI shows a notification that opens the release page in your browser."
+          >
+            <select
+              value={settings?.updates.checkFrequency ?? "daily"}
+              disabled={!settings}
+              onChange={(event) =>
+                void onUpdateCheckFrequencyChange(
+                  event.target.value as UpdateCheckFrequency,
+                )
+              }
+              className="bg-surface border border-border-subtle rounded px-2 py-1 text-xs text-primary focus:outline-none focus:border-accent disabled:opacity-50"
+              aria-label="Automatic update check frequency"
+            >
+              <option value="daily">Once a day</option>
+              <option value="startup">Every launch</option>
+              <option value="manual">Manual only</option>
+            </select>
+          </Row>
+          <div className="flex items-center justify-between gap-4 rounded border border-border-subtle bg-surface/40 px-3 py-2">
+            <div className="min-w-0 flex flex-col">
+              <span className="text-xs text-primary">
+                {appUpdateStatus(appUpdate, settings)}
+              </span>
+              {settings?.updates.lastCheckedAt && (
+                <span className="text-[10px] text-dim mt-0.5">
+                  Last checked {formatUpdateCheckTime(settings.updates.lastCheckedAt)}
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => void handleUpdateAction()}
+              disabled={appUpdate.phase === "checking"}
+              className="inline-flex items-center gap-1.5 shrink-0 px-3 py-1.5 text-xs rounded bg-surface text-secondary hover:text-primary hover:bg-elevated border border-border-subtle transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <RefreshCw
+                size={12}
+                className={appUpdate.phase === "checking" ? "animate-spin" : ""}
+              />
+              {appUpdateActionLabel(appUpdate)}
+            </button>
           </div>
         </Section>
 
@@ -483,7 +571,50 @@ export function SettingsPane() {
   );
 }
 
-const REPO_URL = "https://github.com/fuckmaz/FlipperUI";
+function appUpdateStatus(
+  update: AppUpdateState,
+  settings: AppSettings | null,
+): string {
+  switch (update.phase) {
+    case "checking":
+      return "Checking GitHub Releases…";
+    case "available":
+      return update.latestVersion
+        ? `FlipperUI v${update.latestVersion} is available`
+        : "An update is available";
+    case "up-to-date":
+      return "FlipperUI is up to date";
+    case "error":
+      return update.error ? `Update check failed: ${update.error}` : "Update check failed";
+    default:
+      return settings?.updates.lastCheckedAt
+        ? "No newer version found"
+        : "Updates have not been checked yet";
+  }
+}
+
+function appUpdateActionLabel(update: AppUpdateState): string {
+  switch (update.phase) {
+    case "checking":
+      return "Checking…";
+    case "available":
+      return "View release";
+    case "error":
+      return "Retry";
+    default:
+      return "Check now";
+  }
+}
+
+function formatUpdateCheckTime(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? "previously"
+    : new Intl.DateTimeFormat(undefined, {
+        dateStyle: "medium",
+        timeStyle: "short",
+      }).format(date);
+}
 
 function SettingsFooter({ version }: { version: string | null }) {
   const openIssue = (kind: "bug" | "feedback") => {
@@ -523,6 +654,15 @@ function SettingsFooter({ version }: { version: string | null }) {
       >
         <MessageSquare size={11} />
         Send feedback
+      </button>
+      <span className="text-border-subtle">·</span>
+      <button
+        onClick={() => openUrl(REPO_URL)}
+        title="Open the FlipperUI GitHub repository"
+        className="flex items-center gap-1.5 hover:text-secondary transition-colors"
+      >
+        <GitFork size={11} />
+        GitHub repository
       </button>
     </div>
   );

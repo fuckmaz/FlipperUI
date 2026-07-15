@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "flipperui"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "base64 0.22.1",
  "btleplug",
@@ -1197,6 +1197,7 @@ dependencies = [
  "prost",
  "prost-build",
  "protoc-bin-vendored",
+ "semver",
  "serde",
  "serde_json",
  "serialport",

@@ -136,6 +136,8 @@ pub fn build_tray_menu(
         .enabled(status.connected)
         .build(app)?;
     let nav_settings = MenuItemBuilder::with_id("tray-nav-settings", "Settings…").build(app)?;
+    let check_updates =
+        MenuItemBuilder::with_id("tray-check-updates", "Check for Updates…").build(app)?;
     builder = builder
         .item(&nav_dashboard)
         .item(&nav_files)
@@ -147,6 +149,7 @@ pub fn build_tray_menu(
         .item(&nav_apps)
         .separator()
         .item(&nav_settings)
+        .item(&check_updates)
         .separator();
 
     let quit = MenuItemBuilder::with_id("tray-quit", "Quit FlipperUI").build(app)?;
@@ -333,8 +336,15 @@ pub fn run() {
                     .close_window()
                     .build()?;
 
+                let check_updates =
+                    MenuItemBuilder::with_id("check-app-updates", "Check for Updates…")
+                        .build(app)?;
+                let help_submenu = SubmenuBuilder::new(app, "Help")
+                    .item(&check_updates)
+                    .build()?;
+
                 let menu = MenuBuilder::new(app)
-                    .items(&[&app_submenu, &edit_submenu, &window_submenu])
+                    .items(&[&app_submenu, &edit_submenu, &window_submenu, &help_submenu])
                     .build()?;
                 app.set_menu(menu)?;
             }
@@ -357,6 +367,15 @@ pub fn run() {
                 match id {
                     "settings" => {
                         let _ = app.emit("open-settings", ());
+                    }
+                    "check-app-updates" | "tray-check-updates" => {
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                            let _ = w.unminimize();
+                        }
+                        let _ = app.emit("check-app-updates", ());
+                        let _ = refresh_tray_menu(app);
                     }
                     // Tray menu items — toggle window visibility / quit.
                     "tray-window-toggle" => {
@@ -467,6 +486,7 @@ pub fn run() {
             commands::tray::update_tray_status,
             commands::app_icon::app_icon_variants,
             commands::app_icon::set_app_icon,
+            commands::app_update::app_update_check,
             commands::gpio::gpio_snapshot,
             commands::gpio::gpio_set_mode,
             commands::gpio::gpio_get_mode,

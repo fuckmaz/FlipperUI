@@ -1,7 +1,7 @@
 {
   "name": "flipperui",
   "private": true,
-  "version": "0.4.5",
+  "version": "0.4.6",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,7 +10,8 @@
     "tauri": "tauri",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "release:prepare": "node scripts/prepare-release.mjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.2",

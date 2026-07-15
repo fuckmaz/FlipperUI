@@ -26,6 +26,7 @@ import { notify } from "./lib/notify";
 import { usePreloadLibraries } from "./hooks/usePreloadLibraries";
 import flipperOutlineUrl from "./assets/flipper-outline.svg";
 import { ErrorBanner } from "./components/ui/ErrorBanner";
+import { AppUpdateNotice } from "./components/AppUpdate/AppUpdateNotice";
 
 export default function App() {
   const activeView = useFlipperStore((s) => s.activeView);
@@ -216,6 +217,7 @@ export default function App() {
         <ActivePane activeView={activeView} isConnected={isConnected} />
       </div>
       <CommandPalette />
+      <AppUpdateNotice />
     </div>
   );
 }
