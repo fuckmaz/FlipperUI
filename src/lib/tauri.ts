@@ -2,7 +2,7 @@
  * Typed wrappers over Tauri v2's invoke API.
  * IMPORTANT: In Tauri v2, invoke is imported from "@tauri-apps/api/core", not "@tauri-apps/api/tauri".
  */
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import type { DeviceInfo, FileEntry, PortInfo, StorageInfo } from "../types/flipper";
 import type { SubGhzEntry } from "../types/subghz";
 import type { IrEntry } from "../types/infrared";
@@ -101,6 +101,40 @@ export const syncClock = (
 
 // ── Storage commands ───────────────────────────────────────────────────────
 
+export interface TransferProgress {
+  operationId: number;
+  completed: number;
+  total: number;
+  percent: number;
+}
+
+export interface ScanProgressPayload {
+  operationId: number;
+  scanned: number;
+  total: number;
+  current_path: string;
+}
+
+let activeTransferOperationId: number | null = null;
+
+function transferChannel(
+  onProgress?: (progress: TransferProgress) => void,
+): { channel: Channel<TransferProgress>; operationId: () => number | null } {
+  let operationId: number | null = null;
+  const channel = new Channel<TransferProgress>((progress) => {
+    operationId = progress.operationId;
+    activeTransferOperationId = progress.operationId;
+    onProgress?.(progress);
+  });
+  return { channel, operationId: () => operationId };
+}
+
+function clearTransferOperation(operationId: number | null): void {
+  if (operationId !== null && activeTransferOperationId === operationId) {
+    activeTransferOperationId = null;
+  }
+}
+
 export const storageList = async (path: string): Promise<FileEntry[]> => {
   await awaitCliCleanup();
   return invoke<FileEntry[]>("storage_list", { path });
@@ -115,26 +149,60 @@ export const storageStat = async (path: string): Promise<FileEntry> => {
  * Read a file from the Flipper. Returns base64-encoded bytes.
  * Decode with: Uint8Array.from(atob(result), c => c.charCodeAt(0))
  */
-export const storageRead = async (path: string): Promise<string> => {
+export const storageRead = async (
+  path: string,
+  onProgress?: (progress: TransferProgress) => void,
+): Promise<string> => {
   await awaitCliCleanup();
-  return invoke<string>("storage_read", { path });
+  const progress = transferChannel(onProgress);
+  try {
+    return await invoke<string>("storage_read", {
+      path,
+      onProgress: progress.channel,
+    });
+  } finally {
+    clearTransferOperation(progress.operationId());
+  }
 };
 
 /**
  * Write a file to the Flipper. `data` must be base64-encoded.
  * Encode with: btoa(String.fromCharCode(...new Uint8Array(buffer)))
  */
-export const storageWrite = async (path: string, data: string): Promise<void> => {
+export const storageWrite = async (
+  path: string,
+  data: string,
+  onProgress?: (progress: TransferProgress) => void,
+): Promise<void> => {
   await awaitCliCleanup();
-  return invoke<void>("storage_write", { path, data });
+  const progress = transferChannel(onProgress);
+  try {
+    return await invoke<void>("storage_write", {
+      path,
+      data,
+      onProgress: progress.channel,
+    });
+  } finally {
+    clearTransferOperation(progress.operationId());
+  }
 };
 
 export const storageReadToLocal = async (
   path: string,
   localPath: string,
+  onProgress?: (progress: TransferProgress) => void,
 ): Promise<void> => {
   await awaitCliCleanup();
-  return invoke<void>("storage_read_to_local", { path, local_path: localPath });
+  const progress = transferChannel(onProgress);
+  try {
+    return await invoke<void>("storage_read_to_local", {
+      path,
+      local_path: localPath,
+      on_progress: progress.channel,
+    });
+  } finally {
+    clearTransferOperation(progress.operationId());
+  }
 };
 
 /**
@@ -146,17 +214,37 @@ export const storageReadToLocal = async (
 export const storageReadDirToLocal = async (
   path: string,
   localPath: string,
+  onProgress?: (progress: TransferProgress) => void,
 ): Promise<void> => {
   await awaitCliCleanup();
-  return invoke<void>("storage_read_dir_to_local", { path, local_path: localPath });
+  const progress = transferChannel(onProgress);
+  try {
+    return await invoke<void>("storage_read_dir_to_local", {
+      path,
+      local_path: localPath,
+      on_progress: progress.channel,
+    });
+  } finally {
+    clearTransferOperation(progress.operationId());
+  }
 };
 
 export const storageWriteFromLocal = async (
   path: string,
   localPath: string,
+  onProgress?: (progress: TransferProgress) => void,
 ): Promise<void> => {
   await awaitCliCleanup();
-  return invoke<void>("storage_write_from_local", { path, local_path: localPath });
+  const progress = transferChannel(onProgress);
+  try {
+    return await invoke<void>("storage_write_from_local", {
+      path,
+      local_path: localPath,
+      on_progress: progress.channel,
+    });
+  } finally {
+    clearTransferOperation(progress.operationId());
+  }
 };
 
 export const storageMkdir = async (path: string): Promise<void> => {
@@ -223,7 +311,11 @@ export const storageTarExtract = async (tarPath: string, outPath: string): Promi
 
 /** Cancel an in-progress file transfer (upload or download). */
 export const cancelTransfer = (): Promise<void> =>
-  invoke<void>("cancel_transfer");
+  activeTransferOperationId === null
+    ? Promise.resolve()
+    : invoke<void>("cancel_transfer", {
+        operationId: activeTransferOperationId,
+      });
 
 // ── Device extended commands ──────────────────────────────────────────────
 
@@ -307,6 +399,48 @@ export const subghzTxStop = async (): Promise<void> => {
 
 // ── Sub-GHz library ──────────────────────────────────────────────────────
 
+type ScanFamily =
+  | "subghz"
+  | "infrared"
+  | "nfc"
+  | "rfid"
+  | "badusb"
+  | "apps";
+
+const activeScanOperationIds: Partial<Record<ScanFamily, number>> = {};
+let activePrewalkOperationId: number | null = null;
+
+function scanChannel(
+  family: ScanFamily,
+  onProgress?: (progress: ScanProgressPayload) => void,
+): { channel: Channel<ScanProgressPayload>; operationId: () => number | null } {
+  let operationId: number | null = null;
+  const channel = new Channel<ScanProgressPayload>((progress) => {
+    operationId = progress.operationId;
+    activeScanOperationIds[family] = progress.operationId;
+    onProgress?.(progress);
+  });
+  return { channel, operationId: () => operationId };
+}
+
+function clearScanOperation(family: ScanFamily, operationId: number | null): void {
+  if (operationId !== null && activeScanOperationIds[family] === operationId) {
+    delete activeScanOperationIds[family];
+  }
+}
+
+function cancelScan(command: string, family: ScanFamily): Promise<void> {
+  const operationId = activeScanOperationIds[family];
+  if (operationId !== undefined) {
+    return invoke<void>(command, { operationId });
+  }
+  return family === "apps" || activePrewalkOperationId === null
+    ? Promise.resolve()
+    : invoke<void>("cancel_library_prewalk", {
+        operationId: activePrewalkOperationId,
+      });
+}
+
 /**
  * Scan a directory recursively for .sub files, parse their headers, and
  * return the list. Emits "subghz-scan-progress" events as it works.
@@ -319,18 +453,25 @@ export const subghzScan = async (
   root: string,
   excludedDirs: string[],
   cached?: SubGhzEntry[],
+  onProgress?: (progress: ScanProgressPayload) => void,
 ): Promise<SubGhzEntry[]> => {
   await awaitCliCleanup();
-  return invoke<SubGhzEntry[]>("subghz_scan", {
-    root,
-    excluded_dirs: excludedDirs,
-    cached: cached ?? null,
-  });
+  const progress = scanChannel("subghz", onProgress);
+  try {
+    return await invoke<SubGhzEntry[]>("subghz_scan", {
+      root,
+      excluded_dirs: excludedDirs,
+      cached: cached ?? null,
+      on_progress: progress.channel,
+    });
+  } finally {
+    clearScanOperation("subghz", progress.operationId());
+  }
 };
 
 /** Abort an in-progress SubGhz library scan. */
 export const subghzCancelScan = (): Promise<void> =>
-  invoke<void>("subghz_cancel_scan");
+  cancelScan("subghz_cancel_scan", "subghz");
 
 // ── Infrared library ────────────────────────────────────────────────────
 
@@ -342,18 +483,25 @@ export const infraredScan = async (
   root: string,
   excludedDirs: string[],
   cached?: IrEntry[],
+  onProgress?: (progress: ScanProgressPayload) => void,
 ): Promise<IrEntry[]> => {
   await awaitCliCleanup();
-  return invoke<IrEntry[]>("infrared_scan", {
-    root,
-    excluded_dirs: excludedDirs,
-    cached: cached ?? null,
-  });
+  const progress = scanChannel("infrared", onProgress);
+  try {
+    return await invoke<IrEntry[]>("infrared_scan", {
+      root,
+      excluded_dirs: excludedDirs,
+      cached: cached ?? null,
+      on_progress: progress.channel,
+    });
+  } finally {
+    clearScanOperation("infrared", progress.operationId());
+  }
 };
 
 /** Abort an in-progress Infrared library scan. */
 export const infraredCancelScan = (): Promise<void> =>
-  invoke<void>("infrared_cancel_scan");
+  cancelScan("infrared_cancel_scan", "infrared");
 
 // ── NFC library ─────────────────────────────────────────────────────────
 
@@ -365,18 +513,25 @@ export const nfcScan = async (
   root: string,
   excludedDirs: string[],
   cached?: NfcEntry[],
+  onProgress?: (progress: ScanProgressPayload) => void,
 ): Promise<NfcEntry[]> => {
   await awaitCliCleanup();
-  return invoke<NfcEntry[]>("nfc_scan", {
-    root,
-    excluded_dirs: excludedDirs,
-    cached: cached ?? null,
-  });
+  const progress = scanChannel("nfc", onProgress);
+  try {
+    return await invoke<NfcEntry[]>("nfc_scan", {
+      root,
+      excluded_dirs: excludedDirs,
+      cached: cached ?? null,
+      on_progress: progress.channel,
+    });
+  } finally {
+    clearScanOperation("nfc", progress.operationId());
+  }
 };
 
 /** Abort an in-progress NFC library scan. */
 export const nfcCancelScan = (): Promise<void> =>
-  invoke<void>("nfc_cancel_scan");
+  cancelScan("nfc_cancel_scan", "nfc");
 
 /**
  * Parse the given `.nfc` paths only — no directory walk. Returns one
@@ -398,18 +553,25 @@ export const rfidScan = async (
   root: string,
   excludedDirs: string[],
   cached?: RfidEntry[],
+  onProgress?: (progress: ScanProgressPayload) => void,
 ): Promise<RfidEntry[]> => {
   await awaitCliCleanup();
-  return invoke<RfidEntry[]>("rfid_scan", {
-    root,
-    excluded_dirs: excludedDirs,
-    cached: cached ?? null,
-  });
+  const progress = scanChannel("rfid", onProgress);
+  try {
+    return await invoke<RfidEntry[]>("rfid_scan", {
+      root,
+      excluded_dirs: excludedDirs,
+      cached: cached ?? null,
+      on_progress: progress.channel,
+    });
+  } finally {
+    clearScanOperation("rfid", progress.operationId());
+  }
 };
 
 /** Abort an in-progress RFID library scan. */
 export const rfidCancelScan = (): Promise<void> =>
-  invoke<void>("rfid_cancel_scan");
+  cancelScan("rfid_cancel_scan", "rfid");
 
 /** Parse only the given `.rfid` paths — no directory walk. */
 export const rfidParsePaths = async (paths: string[]): Promise<RfidEntry[]> => {
@@ -429,19 +591,26 @@ export const badusbScan = async (
   kbRoot: string,
   excludedDirs: string[],
   cached?: BadUsbEntry[],
+  onProgress?: (progress: ScanProgressPayload) => void,
 ): Promise<BadUsbEntry[]> => {
   await awaitCliCleanup();
-  return invoke<BadUsbEntry[]>("badusb_scan", {
-    usb_root: usbRoot,
-    kb_root: kbRoot,
-    excluded_dirs: excludedDirs,
-    cached: cached ?? null,
-  });
+  const progress = scanChannel("badusb", onProgress);
+  try {
+    return await invoke<BadUsbEntry[]>("badusb_scan", {
+      usb_root: usbRoot,
+      kb_root: kbRoot,
+      excluded_dirs: excludedDirs,
+      cached: cached ?? null,
+      on_progress: progress.channel,
+    });
+  } finally {
+    clearScanOperation("badusb", progress.operationId());
+  }
 };
 
 /** Abort an in-progress BadUSB library scan. */
 export const badusbCancelScan = (): Promise<void> =>
-  invoke<void>("badusb_cancel_scan");
+  cancelScan("badusb_cancel_scan", "badusb");
 
 // ── Library prewalk ─────────────────────────────────────────────────────
 
@@ -458,6 +627,12 @@ export interface PrewalkDirStat {
   largest_file: PrewalkLargestFile | null;
 }
 
+interface PrewalkProgress {
+  operationId: number;
+  visited: number;
+  current_path: string;
+}
+
 /**
  * Walk the given library roots and return directories that cross the
  * pre-scan thresholds (≥254 direct entries, or contain a >1 MiB file).
@@ -469,11 +644,26 @@ export const libraryPrewalk = async (
   excludedDirs: string[],
 ): Promise<PrewalkDirStat[]> => {
   await awaitCliCleanup();
-  return invoke<PrewalkDirStat[]>("library_prewalk", {
-    library,
-    roots,
-    excluded_dirs: excludedDirs,
+  let operationId: number | null = null;
+  const onProgress = new Channel<PrewalkProgress>((progress) => {
+    operationId = progress.operationId;
+    activePrewalkOperationId = progress.operationId;
   });
+  try {
+    return await invoke<PrewalkDirStat[]>("library_prewalk", {
+      library,
+      roots,
+      excluded_dirs: excludedDirs,
+      on_progress: onProgress,
+    });
+  } finally {
+    if (
+      operationId !== null &&
+      activePrewalkOperationId === operationId
+    ) {
+      activePrewalkOperationId = null;
+    }
+  }
 };
 
 /** parse only BadUSB / BadKB `.txt` paths */
@@ -495,18 +685,25 @@ export const appsScan = async (
   roots: string[],
   excludedDirs: string[],
   cached?: AppEntry[],
+  onProgress?: (progress: ScanProgressPayload) => void,
 ): Promise<AppEntry[]> => {
   await awaitCliCleanup();
-  return invoke<AppEntry[]>("apps_scan", {
-    roots,
-    excluded_dirs: excludedDirs,
-    cached: cached ?? null,
-  });
+  const progress = scanChannel("apps", onProgress);
+  try {
+    return await invoke<AppEntry[]>("apps_scan", {
+      roots,
+      excluded_dirs: excludedDirs,
+      cached: cached ?? null,
+      on_progress: progress.channel,
+    });
+  } finally {
+    clearScanOperation("apps", progress.operationId());
+  }
 };
 
 /** Abort an in-progress App library scan. */
 export const appsCancelScan = (): Promise<void> =>
-  invoke<void>("apps_cancel_scan");
+  cancelScan("apps_cancel_scan", "apps");
 
 /**
  * Parse the given `.fap` paths only — no directory walk. `roots` is the same

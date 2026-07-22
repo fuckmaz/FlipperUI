@@ -1,67 +1,69 @@
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use base64::Engine;
-use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{ipc::Channel, State};
 
-use crate::commands::path::validate_path;
+use crate::commands::client::with_connection;
+use crate::commands::library_scan::ScanProgressEvent;
+use crate::commands::path::{validate_path, DevicePath};
 use crate::error::{FlipperError, Result};
 use crate::flipper::apps::{self, AppEntry};
 use crate::flipper::{fap_icon, storage};
-use crate::state::{AppState, ConnectionMode};
-
-#[derive(Serialize, Clone)]
-struct ScanProgress<'a> {
-    scanned: u32,
-    total: u32,
-    current_path: &'a str,
-}
+use crate::operation::{require_cancelled, OperationName};
+use crate::state::AppState;
 
 /// Scan one or more roots for `.fap` files and return a parsed list.
 /// Emits `apps-scan-progress` events as it works.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn apps_scan(
-    roots: Vec<String>,
-    excluded_dirs: Vec<String>,
+    roots: Vec<DevicePath>,
+    excluded_dirs: Vec<DevicePath>,
     cached: Option<Vec<AppEntry>>,
     state: State<'_, AppState>,
-    app: AppHandle,
+    on_progress: Channel<ScanProgressEvent>,
 ) -> Result<Vec<AppEntry>> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-    let cancelled = Arc::clone(&state.apps_scan_cancelled);
-    cancelled.store(false, Ordering::Relaxed);
-
-    tauri::async_runtime::spawn_blocking(move || {
+    let operation = state.operations.begin(OperationName::AppsScan)?;
+    let operation_id = operation.id();
+    let cancelled = operation.cancel_token();
+    let initial_path = roots.first().map(ToString::to_string).unwrap_or_default();
+    let _ = on_progress.send(ScanProgressEvent {
+        operation_id,
+        scanned: 0,
+        total: 0,
+        current_path: initial_path,
+    });
+    let roots = roots
+        .into_iter()
+        .map(DevicePath::into_string)
+        .collect::<Vec<_>>();
+    let excluded_dirs = excluded_dirs
+        .into_iter()
+        .map(DevicePath::into_string)
+        .collect::<Vec<_>>();
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
+        let _operation = operation;
         for r in &roots {
             validate_path(r)?;
         }
-        {
-            let mode = mode_mutex.lock().unwrap();
-            if *mode == ConnectionMode::Cli {
-                return Err(FlipperError::CliModeActive);
-            }
-        }
-        let mut guard = client_mutex.lock().unwrap();
-        let client = guard.as_mut().ok_or(FlipperError::NotConnected)?;
 
         let cached_map: HashMap<String, AppEntry> = cached
             .unwrap_or_default()
             .into_iter()
-            .map(|e| (e.path.clone(), e))
-            .collect();
+            .map(|entry| {
+                let path = DevicePath::try_from(entry.path.as_str())?.into_string();
+                DevicePath::try_from(entry.root.as_str())?;
+                Ok((path, entry))
+            })
+            .collect::<Result<_>>()?;
 
         let mut on_progress = |scanned: u32, total: u32, current: &str| {
-            let _ = app.emit(
-                "apps-scan-progress",
-                ScanProgress {
-                    scanned,
-                    total,
-                    current_path: current,
-                },
-            );
+            let _ = on_progress.send(ScanProgressEvent {
+                operation_id,
+                scanned,
+                total,
+                current_path: current.to_string(),
+            });
         };
 
         apps::scan_library(
@@ -74,13 +76,15 @@ pub async fn apps_scan(
         )
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 #[tauri::command]
-pub fn apps_cancel_scan(state: State<AppState>) -> Result<()> {
-    state.apps_scan_cancelled.store(true, Ordering::Relaxed);
-    Ok(())
+pub fn apps_cancel_scan(operation_id: u64, state: State<AppState>) -> Result<()> {
+    require_cancelled(
+        state
+            .operations
+            .cancel(OperationName::AppsScan, operation_id),
+    )
 }
 
 /// Parse a specific list of `.fap` paths without walking the library.
@@ -88,29 +92,25 @@ pub fn apps_cancel_scan(state: State<AppState>) -> Result<()> {
 /// apps into the library view without a full rescan.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn apps_parse_paths(
-    paths: Vec<String>,
-    roots: Vec<String>,
+    paths: Vec<DevicePath>,
+    roots: Vec<DevicePath>,
     state: State<'_, AppState>,
 ) -> Result<Vec<AppEntry>> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
+    let paths = paths
+        .into_iter()
+        .map(DevicePath::into_string)
+        .collect::<Vec<_>>();
+    let roots = roots
+        .into_iter()
+        .map(DevicePath::into_string)
+        .collect::<Vec<_>>();
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         for r in &roots {
             validate_path(r)?;
         }
-        {
-            let mode = mode_mutex.lock().unwrap();
-            if *mode == ConnectionMode::Cli {
-                return Err(FlipperError::CliModeActive);
-            }
-        }
-        let mut guard = client_mutex.lock().unwrap();
-        let client = guard.as_mut().ok_or(FlipperError::NotConnected)?;
         apps::parse_paths(client, &paths, &roots)
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 /// Read a `.fap` and extract its embedded 10x10 icon, returned as
@@ -120,28 +120,19 @@ pub async fn apps_parse_paths(
 /// Returns `Ok(None)` when the file has no embedded icon (or the manifest
 /// can't be located) — the UI then falls back to the placeholder glyph.
 #[tauri::command(rename_all = "snake_case")]
-pub async fn apps_read_icon(path: String, state: State<'_, AppState>) -> Result<Option<String>> {
+pub async fn apps_read_icon(
+    path: DevicePath,
+    state: State<'_, AppState>,
+) -> Result<Option<String>> {
     if !path.to_lowercase().ends_with(".fap") {
         return Err(FlipperError::Session("Not a .fap file".into()));
     }
 
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-    tauri::async_runtime::spawn_blocking(move || {
-        {
-            let mode = mode_mutex.lock().unwrap();
-            if *mode == ConnectionMode::Cli {
-                return Err(FlipperError::CliModeActive);
-            }
-        }
-        let mut guard = client_mutex.lock().unwrap();
-        let client = guard.as_mut().ok_or(FlipperError::NotConnected)?;
-
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         let bytes = storage::storage_read(client, &path, |_, _| {}, || false)?;
         let icon = fap_icon::extract(&bytes)
             .map(|d| base64::engine::general_purpose::STANDARD.encode(d.icon));
         Ok(icon)
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }

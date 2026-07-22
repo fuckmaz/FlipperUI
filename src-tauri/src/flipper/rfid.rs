@@ -30,6 +30,7 @@ use crate::flipper::storage;
 /// Parsed metadata for a single `.rfid` file.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RfidEntry {
+    #[serde(deserialize_with = "crate::commands::path::deserialize_device_path_string")]
     pub path: String,
     pub name: String,
     /// Protocol family reported by stock firmware (e.g. "EM4100", "H10301").

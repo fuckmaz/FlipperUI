@@ -1,8 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { Usb, Power, BatteryLow, BatteryMedium, BatteryFull, BatteryWarning, Zap, HardDrive, Bluetooth, Signal, SignalLow, SignalMedium, SignalHigh, Link as LinkIcon, Unlink } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
-import { connect, disconnect, listPorts, powerInfo, storageInfo, reboot, ping } from "../../lib/tauri";
+import { disconnect, listPorts, reboot } from "../../lib/tauri";
 import { useFlipperStore } from "../../store/useFlipperStore";
+import { useDeviceTelemetry } from "../../lib/deviceTelemetry";
+import {
+  connectPreferredUsbDevice,
+  connectSelectedUsbDevice,
+  migrateLegacyUsbPort,
+} from "../../lib/usbConnection";
 import { loadSettings, subscribeSettings, updateSettings } from "../../lib/settings";
 import { syncClockOnConnectIfEnabled } from "../../lib/clockSync";
 import { Spinner } from "../ui/Spinner";
@@ -29,11 +35,21 @@ export function DevicePanel() {
   const setConnected = useFlipperStore((s) => s.setConnected);
   const setError = useFlipperStore((s) => s.setError);
 
-  const [batteryCharge, setBatteryCharge] = useState<string | null>(null);
-  const [batteryCharging, setBatteryCharging] = useState(false);
-  const [sdTotal, setSdTotal] = useState<number | null>(null);
-  const [sdFree, setSdFree] = useState<number | null>(null);
-  const [latency, setLatency] = useState<number | null>(null);
+  const telemetry = useDeviceTelemetry();
+  const batteryCharge =
+    telemetry.power?.["charge_level"] ?? telemetry.power?.["charge"] ?? null;
+  const currentMa = Number(
+    telemetry.power?.["battery_current"] ??
+      telemetry.power?.["current_gauge"] ??
+      telemetry.power?.["current"] ??
+      "0",
+  );
+  const batteryCharging =
+    telemetry.power?.["charging"] === "true" ||
+    (Number.isFinite(currentMa) && currentMa > 5);
+  const sdTotal = telemetry.storage?.total_space ?? null;
+  const sdFree = telemetry.storage?.free_space ?? null;
+  const latency = telemetry.latency;
 
   // Track whether the user manually disconnected — suppresses auto-connect
   // until the device is physically unplugged and re-plugged.
@@ -54,17 +70,20 @@ export function DevicePanel() {
   // preferred one.
   const [settingsHydrated, setSettingsHydrated] = useState(false);
   const [autoReconnect, setAutoReconnect] = useState(false);
+  const legacyLastPortRef = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     loadSettings()
-      .then((s) => {
+      .then(async (s) => {
         if (cancelled) return;
         setTransport(s.connection.transport);
         setAutoReconnect(s.connection.autoReconnect);
-        if (s.connection.lastPort) {
+        legacyLastPortRef.current = s.connection.lastPort;
+        const preferredPort = await migrateLegacyUsbPort(s.connection.lastPort);
+        if (preferredPort && !cancelled) {
           const state = useFlipperStore.getState();
-          if (!state.selectedPort) setSelectedPort(s.connection.lastPort);
+          if (!state.selectedPort) setSelectedPort(preferredPort);
         }
       })
       .catch(() => {})
@@ -140,24 +159,34 @@ export function DevicePanel() {
         // user has opted in via settings, and the target port isn't in
         // cooldown from a recent failed attempt.
         if (autoReconnect && transport === "usb" && flipper && !state.isConnected && !state.isConnecting && !userDisconnected) {
-          const port = state.selectedPort ?? flipper.name;
-          const lastFailedAt = failedConnectRef.current.get(port) ?? 0;
-          const inCooldown = Date.now() - lastFailedAt < FAILED_CONNECT_COOLDOWN_MS;
-          if (!inCooldown) {
-            setSelectedPort(port);
+          const candidates = p.filter((candidate) => {
+            const lastFailedAt = failedConnectRef.current.get(candidate.name) ?? 0;
+            return Date.now() - lastFailedAt >= FAILED_CONNECT_COOLDOWN_MS;
+          });
+          if (candidates.some((candidate) => candidate.is_flipper)) {
             setConnecting(true);
             setError(null);
             try {
-              const info = await connect(port);
+              const info = await connectPreferredUsbDevice(
+                candidates,
+                legacyLastPortRef.current,
+              );
               const clockError = await maybeSyncClockAfterConnect();
+              setSelectedPort(info.port);
+              legacyLastPortRef.current = info.port;
+              void updateSettings({ connection: { lastPort: info.port } }).catch(() => {});
               setConnected(info, "serial");
-              failedConnectRef.current.delete(port);
+              failedConnectRef.current.delete(info.port);
               if (clockError) setError(clockError);
             } catch (err) {
               setConnecting(false);
-              failedConnectRef.current.set(port, Date.now());
+              for (const candidate of candidates) {
+                if (candidate.is_flipper) {
+                  failedConnectRef.current.set(candidate.name, Date.now());
+                }
+              }
               setError(
-                `Auto-connect to ${port} failed${err instanceof Error && err.message ? `: ${err.message}` : ""} — will retry in ${Math.round(FAILED_CONNECT_COOLDOWN_MS / 1000)}s`,
+                `Auto-connect to the saved Flipper failed${err instanceof Error && err.message ? `: ${err.message}` : ""} — will retry in ${Math.round(FAILED_CONNECT_COOLDOWN_MS / 1000)}s`,
               );
             }
           }
@@ -188,48 +217,6 @@ export function DevicePanel() {
     return () => clearInterval(id);
   }, [setPorts, setSelectedPort, setConnecting, setConnected, setError, userDisconnected, transport, settingsHydrated, autoReconnect]);
 
-  // Fetch power + storage info after connection
-  useEffect(() => {
-    if (!isConnected) {
-      setBatteryCharge(null);
-      setBatteryCharging(false);
-      setSdTotal(null);
-      setSdFree(null);
-      setLatency(null);
-      return;
-    }
-
-    const fetchInfo = async () => {
-      try {
-        const pi = await powerInfo();
-        // Firmware versions vary on the key name — newer builds use
-        // `charge_level`, older ones use `charge`. Same for current/charging
-        // (older "charging"=="true", newer report a positive `battery_current`).
-        const charge = pi["charge_level"] ?? pi["charge"] ?? null;
-        setBatteryCharge(charge);
-        const currentMa = Number(
-          pi["battery_current"] ?? pi["current_gauge"] ?? pi["current"] ?? "0",
-        );
-        setBatteryCharging(
-          pi["charging"] === "true" || (Number.isFinite(currentMa) && currentMa > 5),
-        );
-      } catch {
-        // Power info may not be available on all firmware
-      }
-      try {
-        const si = await storageInfo("/ext");
-        setSdTotal(si.total_space);
-        setSdFree(si.free_space);
-      } catch {
-        // Storage info may fail if no SD card
-      }
-    };
-
-    fetchInfo();
-    const id = setInterval(fetchInfo, 30000); // refresh every 30s
-    return () => clearInterval(id);
-  }, [isConnected]);
-
   // Mirror device state into the system-tray flyout menu so users see
   // connection status + battery without opening the window. The tray rebuilds
   // its menu on every push, so we only call when one of the inputs changes.
@@ -259,26 +246,6 @@ export function DevicePanel() {
   // App.tsx — having a second reconnect chain here would race the App-level one
   // for the BLE adapter on every drop.
 
-  // Poll ping latency for connection-quality indicator.
-  useEffect(() => {
-    if (!isConnected) return;
-    let cancelled = false;
-    const tick = async () => {
-      try {
-        const ms = await ping();
-        if (!cancelled) setLatency(ms);
-      } catch {
-        if (!cancelled) setLatency(null);
-      }
-    };
-    tick();
-    const id = setInterval(tick, 4000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, [isConnected]);
-
   const handleConnect = async () => {
     if (!selectedPort) return;
     // Manual connect always overrides any auto-connect cooldown — the user is
@@ -289,8 +256,10 @@ export function DevicePanel() {
     setConnecting(true);
     setError(null);
     try {
-      const info = await connect(selectedPort);
+      const info = await connectSelectedUsbDevice(selectedPort);
       const clockError = await maybeSyncClockAfterConnect();
+      legacyLastPortRef.current = info.port;
+      void updateSettings({ connection: { lastPort: info.port } }).catch(() => {});
       setConnected(info, "serial");
       if (clockError) setError(clockError);
     } catch (e: unknown) {

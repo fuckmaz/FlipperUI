@@ -1,4 +1,5 @@
 use prost::Message;
+use std::time::{Duration, Instant};
 
 use crate::error::{FlipperError, Result};
 use crate::flipper::diag;
@@ -11,6 +12,19 @@ use crate::pb::main::Content;
 /// 1 MiB is a generous ceiling that still bounds memory if a corrupt or
 /// malicious stream announces a huge length prefix.
 pub const MAX_FRAME_SIZE: usize = 1 << 20;
+
+/// Error from a deadline-aware framed read.
+#[derive(Debug)]
+pub enum DeadlineReadError {
+    DeadlineElapsed,
+    Flipper(FlipperError),
+}
+
+impl From<FlipperError> for DeadlineReadError {
+    fn from(error: FlipperError) -> Self {
+        Self::Flipper(error)
+    }
+}
 
 /// Read a protobuf-style varint from the transport.
 ///
@@ -104,6 +118,168 @@ pub fn read_message(t: &mut dyn Transport) -> Result<pb::Main> {
     Ok(msg)
 }
 
+/// Read one framed message without allowing any individual prefix/body read to
+/// outlive `deadline`.
+///
+/// The remaining monotonic budget is recomputed immediately before every
+/// blocking read and applied to the transport. Prefix and body rollback match
+/// [`read_varint`] and [`read_message`], including the same frame-size cap.
+pub fn read_message_until(
+    t: &mut dyn Transport,
+    deadline: Instant,
+    max_read_slice: Duration,
+) -> std::result::Result<pb::Main, DeadlineReadError> {
+    read_message_with_budget(t, max_read_slice, || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+    })
+}
+
+fn read_message_with_budget(
+    t: &mut dyn Transport,
+    max_read_slice: Duration,
+    mut remaining: impl FnMut() -> Option<Duration>,
+) -> std::result::Result<pb::Main, DeadlineReadError> {
+    let len = read_varint_with_budget(t, max_read_slice, &mut remaining)?;
+    if (len as usize) > MAX_FRAME_SIZE {
+        return Err(FlipperError::Decode(prost::DecodeError::new(format!(
+            "frame length {len} exceeds MAX_FRAME_SIZE ({MAX_FRAME_SIZE})"
+        )))
+        .into());
+    }
+
+    let mut buf = vec![0u8; len as usize];
+    if let Err(error) = read_body_with_budget(t, &mut buf, max_read_slice, &mut remaining) {
+        let mut varint_buf = [0u8; 10];
+        let n = encode_varint(len as u64, &mut varint_buf);
+        t.unread(&varint_buf[..n]);
+        return Err(error);
+    }
+
+    let msg = pb::Main::decode(buf.as_slice()).map_err(FlipperError::from)?;
+    diag::log(diag::Direction::Rx, &msg, len as usize);
+    Ok(msg)
+}
+
+fn read_varint_with_budget(
+    t: &mut dyn Transport,
+    max_read_slice: Duration,
+    remaining: &mut impl FnMut() -> Option<Duration>,
+) -> std::result::Result<u32, DeadlineReadError> {
+    let mut result: u64 = 0;
+    let mut shift = 0u32;
+    let mut byte = [0u8; 1];
+    let mut consumed = [0u8; 5];
+    let mut consumed_len = 0usize;
+
+    loop {
+        if let Err(error) = read_exact_with_budget(t, &mut byte, max_read_slice, remaining) {
+            if consumed_len > 0 {
+                t.unread(&consumed[..consumed_len]);
+            }
+            return Err(error);
+        }
+        if consumed_len < consumed.len() {
+            consumed[consumed_len] = byte[0];
+            consumed_len += 1;
+        }
+        let value = u64::from(byte[0]);
+        result |= (value & 0x7f) << shift;
+        if value & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        if shift >= 35 {
+            return Err(FlipperError::Decode(prost::DecodeError::new("varint overflow")).into());
+        }
+    }
+
+    if result > u64::from(u32::MAX) {
+        return Err(FlipperError::Decode(prost::DecodeError::new(
+            "message length exceeds u32::MAX",
+        ))
+        .into());
+    }
+    Ok(result as u32)
+}
+
+fn read_exact_with_budget(
+    t: &mut dyn Transport,
+    buffer: &mut [u8],
+    max_read_slice: Duration,
+    remaining: &mut impl FnMut() -> Option<Duration>,
+) -> std::result::Result<(), DeadlineReadError> {
+    let budget = remaining().ok_or(DeadlineReadError::DeadlineElapsed)?;
+    t.set_timeout(budget.min(max_read_slice))
+        .map_err(|error| DeadlineReadError::Flipper(error.into()))?;
+    match t.read_exact(buffer) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::Interrupted
+            ) && remaining().is_none() =>
+        {
+            Err(DeadlineReadError::DeadlineElapsed)
+        }
+        Err(error) => Err(DeadlineReadError::Flipper(error.into())),
+    }
+}
+
+fn read_body_with_budget(
+    t: &mut dyn Transport,
+    buffer: &mut [u8],
+    max_read_slice: Duration,
+    remaining: &mut impl FnMut() -> Option<Duration>,
+) -> std::result::Result<(), DeadlineReadError> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let read_result = match remaining() {
+            Some(budget) => t
+                .set_timeout(budget.min(max_read_slice))
+                .map_err(|error| DeadlineReadError::Flipper(error.into()))
+                .and_then(|()| {
+                    t.read(&mut buffer[filled..]).map_err(|error| {
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::Interrupted
+                        ) && remaining().is_none()
+                        {
+                            DeadlineReadError::DeadlineElapsed
+                        } else {
+                            DeadlineReadError::Flipper(error.into())
+                        }
+                    })
+                }),
+            None => Err(DeadlineReadError::DeadlineElapsed),
+        };
+
+        match read_result {
+            Ok(0) => {
+                t.unread(&buffer[..filled]);
+                return Err(DeadlineReadError::Flipper(
+                    std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "transport returned 0 bytes while reading a frame body",
+                    )
+                    .into(),
+                ));
+            }
+            Ok(read) => filled += read,
+            Err(error) => {
+                t.unread(&buffer[..filled]);
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Read the next RPC response, silently discarding any unsolicited screen-stream
 /// frames that may be sitting in the rx buffer.
 ///
@@ -113,7 +289,7 @@ pub fn read_message(t: &mut dyn Transport) -> Result<pb::Main> {
 /// continuously; if a periodic command (ping, power_info, …) writes its
 /// request and then calls `read_message`, the next bytes off the wire are
 /// frequently a screen frame the reader thread didn't get to first. Treating
-/// that frame as a "wrong command_id" response made `with_client` tear down the
+/// that frame as a "wrong command_id" response made the legacy caller tear down the
 /// session and silently kill the screen reader. Skipping the frame here keeps
 /// both consumers happy at the cost of dropping a single frame per racing call.
 ///
@@ -176,6 +352,7 @@ mod tests {
     struct ChunkedTransport {
         chunks: std::collections::VecDeque<Vec<u8>>,
         pushback: std::collections::VecDeque<u8>,
+        timeouts: Vec<std::time::Duration>,
     }
 
     impl ChunkedTransport {
@@ -183,6 +360,7 @@ mod tests {
             Self {
                 chunks: chunks.into(),
                 pushback: std::collections::VecDeque::new(),
+                timeouts: Vec::new(),
             }
         }
     }
@@ -222,8 +400,27 @@ mod tests {
             }
             Ok(())
         }
-        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-            unimplemented!()
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            if !self.pushback.is_empty() {
+                let take = buf.len().min(self.pushback.len());
+                for slot in &mut buf[..take] {
+                    *slot = self.pushback.pop_front().unwrap();
+                }
+                return Ok(take);
+            }
+            let Some(chunk) = self.chunks.pop_front() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "no more chunks",
+                ));
+            };
+            let take = buf.len().min(chunk.len());
+            buf[..take].copy_from_slice(&chunk[..take]);
+            self.pushback.extend(chunk[take..].iter().copied());
+            Ok(take)
         }
         fn write_all(&mut self, _buf: &[u8]) -> std::io::Result<()> {
             unimplemented!()
@@ -231,7 +428,8 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
-        fn set_timeout(&mut self, _dur: std::time::Duration) -> std::io::Result<()> {
+        fn set_timeout(&mut self, dur: std::time::Duration) -> std::io::Result<()> {
+            self.timeouts.push(dur);
             Ok(())
         }
         fn unread(&mut self, bytes: &[u8]) {
@@ -241,6 +439,87 @@ mod tests {
         }
         fn kind(&self) -> crate::flipper::transport::TransportKind {
             crate::flipper::transport::TransportKind::Ble
+        }
+    }
+
+    struct SlowDripTransport {
+        source: std::collections::VecDeque<u8>,
+        pushback: std::collections::VecDeque<u8>,
+        max_short_read: usize,
+        short_read_calls: usize,
+        timeouts: Vec<Duration>,
+    }
+
+    impl SlowDripTransport {
+        fn new(bytes: Vec<u8>, max_short_read: usize) -> Self {
+            Self {
+                source: bytes.into(),
+                pushback: std::collections::VecDeque::new(),
+                max_short_read,
+                short_read_calls: 0,
+                timeouts: Vec::new(),
+            }
+        }
+
+        fn pop_byte(&mut self) -> Option<u8> {
+            self.pushback
+                .pop_front()
+                .or_else(|| self.source.pop_front())
+        }
+    }
+
+    impl crate::flipper::transport::Transport for SlowDripTransport {
+        fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+            let mut filled = 0;
+            while filled < buf.len() {
+                let Some(byte) = self.pop_byte() else {
+                    self.unread(&buf[..filled]);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "slow-drip source exhausted",
+                    ));
+                };
+                buf[filled] = byte;
+                filled += 1;
+            }
+            Ok(())
+        }
+
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.short_read_calls += 1;
+            let limit = buf.len().min(self.max_short_read);
+            let mut filled = 0;
+            while filled < limit {
+                let Some(byte) = self.pop_byte() else {
+                    break;
+                };
+                buf[filled] = byte;
+                filled += 1;
+            }
+            Ok(filled)
+        }
+
+        fn write_all(&mut self, _buf: &[u8]) -> std::io::Result<()> {
+            unimplemented!()
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn set_timeout(&mut self, dur: Duration) -> std::io::Result<()> {
+            self.timeouts.push(dur);
+            Ok(())
+        }
+
+        fn unread(&mut self, bytes: &[u8]) {
+            for byte in bytes.iter().rev() {
+                self.pushback.push_front(*byte);
+            }
+        }
+
+        fn kind(&self) -> crate::flipper::transport::TransportKind {
+            crate::flipper::transport::TransportKind::Serial
         }
     }
 
@@ -288,5 +567,175 @@ mod tests {
         let decoded = pb::Main::decode(encoded.as_slice()).unwrap();
         assert_eq!(decoded.command_id, 42);
         assert!(!decoded.has_next);
+    }
+
+    fn framed_screen_message() -> (pb::Main, Vec<u8>) {
+        let message = pb::Main {
+            command_id: 3,
+            command_status: 0,
+            has_next: false,
+            content: Some(Content::GuiScreenFrame(crate::pb_gui::ScreenFrame {
+                data: vec![0x5a; 256],
+                orientation: 0,
+                bg_color: 0,
+                fg_color: 1,
+            })),
+        };
+        let encoded = message.encode_to_vec();
+        assert!(encoded.len() >= 128, "test requires a multi-byte varint");
+        let mut framed = Vec::new();
+        let mut varint = [0u8; 10];
+        let prefix_len = encode_varint(encoded.len() as u64, &mut varint);
+        assert_eq!(prefix_len, 2, "fixture should use two prefix reads");
+        framed.extend_from_slice(&varint[..prefix_len]);
+        framed.extend_from_slice(&encoded);
+        (message, framed)
+    }
+
+    fn message_with_encoded_len(target: usize) -> pb::Main {
+        let mut data_len = target;
+        for _ in 0..8 {
+            let message = pb::Main {
+                command_id: 1,
+                command_status: 0,
+                has_next: false,
+                content: Some(Content::GuiScreenFrame(crate::pb_gui::ScreenFrame {
+                    data: vec![0x5a; data_len],
+                    orientation: 0,
+                    bg_color: 0,
+                    fg_color: 1,
+                })),
+            };
+            let encoded_len = message.encoded_len();
+            if encoded_len == target {
+                return message;
+            }
+            if encoded_len > target {
+                data_len -= encoded_len - target;
+            } else {
+                data_len += target - encoded_len;
+            }
+        }
+        panic!("could not build a protobuf message with encoded length {target}");
+    }
+
+    #[test]
+    fn frame_size_cap_accepts_exact_boundary_and_rejects_one_over() {
+        let exact = message_with_encoded_len(MAX_FRAME_SIZE);
+        let exact_body = exact.encode_to_vec();
+        assert_eq!(exact_body.len(), MAX_FRAME_SIZE);
+        let mut exact_frame = Vec::with_capacity(MAX_FRAME_SIZE + 4);
+        let mut prefix = [0; 10];
+        let prefix_len = encode_varint(exact_body.len() as u64, &mut prefix);
+        exact_frame.extend_from_slice(&prefix[..prefix_len]);
+        exact_frame.extend_from_slice(&exact_body);
+
+        let mut exact_transport = ChunkedTransport::new(vec![exact_frame]);
+        let decoded = read_message(&mut exact_transport).unwrap();
+        assert_eq!(decoded, exact);
+
+        let mut over_prefix = [0; 10];
+        let over_prefix_len = encode_varint((MAX_FRAME_SIZE + 1) as u64, &mut over_prefix);
+        let mut over_transport =
+            ChunkedTransport::new(vec![over_prefix[..over_prefix_len].to_vec()]);
+        let error = read_message(&mut over_transport).unwrap_err();
+        assert!(matches!(error, FlipperError::Decode(_)));
+        assert!(error.to_string().contains("exceeds MAX_FRAME_SIZE"));
+    }
+
+    #[test]
+    fn deadline_reader_recomputes_decreasing_timeout_for_each_prefix_and_body_read() {
+        let (message, framed) = framed_screen_message();
+        let mut transport = ChunkedTransport::new(vec![framed]);
+        let mut budgets = [
+            Some(Duration::from_millis(9)),
+            Some(Duration::from_millis(6)),
+            Some(Duration::from_millis(3)),
+        ]
+        .into_iter();
+
+        let decoded = read_message_with_budget(&mut transport, Duration::from_secs(1), || {
+            budgets.next().flatten()
+        })
+        .unwrap();
+
+        assert_eq!(decoded.command_id, message.command_id);
+        assert_eq!(
+            transport.timeouts,
+            [
+                Duration::from_millis(9),
+                Duration::from_millis(6),
+                Duration::from_millis(3)
+            ]
+        );
+    }
+
+    #[test]
+    fn deadline_before_body_rolls_back_prefix_for_a_later_transactional_read() {
+        let (message, framed) = framed_screen_message();
+        let mut transport = ChunkedTransport::new(vec![framed]);
+        let mut budgets = [
+            Some(Duration::from_millis(9)),
+            Some(Duration::from_millis(6)),
+            None,
+        ]
+        .into_iter();
+
+        let deadline = read_message_with_budget(&mut transport, Duration::from_secs(1), || {
+            budgets.next().flatten()
+        });
+        assert!(matches!(deadline, Err(DeadlineReadError::DeadlineElapsed)));
+
+        let decoded = read_message(&mut transport).unwrap();
+        assert_eq!(decoded.command_id, message.command_id);
+    }
+
+    #[test]
+    fn deadline_mid_body_stops_before_another_read_and_recovers_exact_frame() {
+        let (message, framed) = framed_screen_message();
+        let mut transport = SlowDripTransport::new(framed, 3);
+        let mut budgets = [
+            Some(Duration::from_millis(9)),
+            Some(Duration::from_millis(8)),
+            Some(Duration::from_millis(7)),
+            Some(Duration::from_millis(6)),
+            None,
+        ]
+        .into_iter();
+
+        let result = read_message_with_budget(&mut transport, Duration::from_secs(1), || {
+            budgets.next().flatten()
+        });
+
+        assert!(matches!(result, Err(DeadlineReadError::DeadlineElapsed)));
+        assert_eq!(transport.short_read_calls, 2);
+        assert_eq!(transport.timeouts.len(), 4);
+
+        let recovered = read_message(&mut transport).unwrap();
+        assert_eq!(recovered, message);
+    }
+
+    #[test]
+    fn repeated_mid_body_deadlines_restore_the_same_frame_each_time() {
+        let (message, framed) = framed_screen_message();
+        let mut transport = SlowDripTransport::new(framed, 2);
+
+        for attempt in 1..=3 {
+            let mut budgets = [
+                Some(Duration::from_millis(9)),
+                Some(Duration::from_millis(8)),
+                Some(Duration::from_millis(7)),
+                None,
+            ]
+            .into_iter();
+            let result = read_message_with_budget(&mut transport, Duration::from_secs(1), || {
+                budgets.next().flatten()
+            });
+            assert!(matches!(result, Err(DeadlineReadError::DeadlineElapsed)));
+            assert_eq!(transport.short_read_calls, attempt);
+        }
+
+        let recovered = read_message(&mut transport).unwrap();
+        assert_eq!(recovered, message);
     }
 }

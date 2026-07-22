@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { RadioTower, AlertTriangle } from "lucide-react";
 import { useFlipperStore } from "../../store/useFlipperStore";
 import { subghzCancelScan, subghzScan } from "../../lib/tauri";
 import { loadSettings, subscribeSettings, updateSettings } from "../../lib/settings";
 import { useLibraryPreScan } from "../../hooks/useLibraryPreScan";
 import { notify } from "../../lib/notify";
+import { commandErrorMessage, isCommandCancelled } from "../../lib/commandError";
 import {
   loadSubghzCache,
   saveSubghzCache,
@@ -13,7 +13,8 @@ import {
 } from "../../lib/subghzCache";
 import { LibraryToolbar } from "./LibraryToolbar";
 import { LibraryTable } from "./LibraryTable";
-import type { ScanProgress } from "../../types/subghz";
+import type { SubGhzEntry } from "../../types/subghz";
+import { subghzFavoriteIdentity } from "../../lib/subghzFavorites";
 
 const SUBGHZ_ROOT = "/ext/subghz";
 
@@ -37,10 +38,11 @@ export function SubGhzLibrary() {
   const [cacheScannedAt, setCacheScannedAt] = useState<number | null>(null);
   const { checkBeforeScan, modal: preScanModal } = useLibraryPreScan("subghz");
 
-  const toggleFavorite = (path: string) => {
-    const next = favorites.includes(path)
-      ? favorites.filter((p) => p !== path)
-      : [...favorites, path];
+  const toggleFavorite = (entry: SubGhzEntry) => {
+    const identity = subghzFavoriteIdentity(entry);
+    const next = favorites.includes(identity)
+      ? favorites.filter((favorite) => favorite !== identity)
+      : [...favorites, identity];
     setFavorites(next);
     if (deviceUid) saveSubghzFavorites(deviceUid, next).catch(() => {});
   };
@@ -60,22 +62,6 @@ export function SubGhzLibrary() {
       clearInjection(null);
     }
   }, [injection, clearInjection]);
-
-  // Stream scan progress events from the Rust side.
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-    listen<ScanProgress>("subghz-scan-progress", (e) =>
-      setProgress(e.payload),
-    ).then((u) => {
-      if (cancelled) u();
-      else unlisten = u;
-    });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [setProgress]);
 
   // Hydrate from the on-disk cache the moment we know which device we're on.
   // Fires on every deviceUid change, which includes reconnecting — fine
@@ -112,17 +98,22 @@ export function SubGhzLibrary() {
       if (effective === null) return; // user closed the prescan modal
       // Feed the current in-memory list (which was hydrated from disk) as
       // the cache hint — Rust skips reading any file whose mtime matches.
-      const list = await subghzScan(SUBGHZ_ROOT, effective, entries);
+      const list = await subghzScan(
+        SUBGHZ_ROOT,
+        effective,
+        entries,
+        setProgress,
+      );
       setEntries(list);
       if (deviceUid) {
-        await saveSubghzCache(deviceUid, list).catch(() => {});
+        const cache = await saveSubghzCache(deviceUid, list).catch(() => null);
+        if (cache) setFavorites(cache.favorites);
         setCacheScannedAt(Date.now());
       }
       void notify("libraryScan", "Sub-GHz scan complete", `${list.length} entries indexed.`);
     } catch (e) {
-      const msg = (e as Error).message || String(e);
-      if (!msg.toLowerCase().includes("cancelled")) {
-        setError(`Scan failed: ${msg}`);
+      if (!isCommandCancelled(e)) {
+        setError(`Scan failed: ${commandErrorMessage(e, "subghz_scan")}`);
       }
     } finally {
       setScanning(false);
@@ -148,7 +139,7 @@ export function SubGhzLibrary() {
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return entries.filter((e) => {
-      if (starredOnly && !favSet.has(e.path)) return false;
+      if (starredOnly && !favSet.has(subghzFavoriteIdentity(e))) return false;
       if (protocolFilter && e.protocol !== protocolFilter) return false;
       if (!q) return true;
       const haystack = [e.name, e.protocol, e.preset, e.key, e.modulation]

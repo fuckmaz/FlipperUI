@@ -27,6 +27,7 @@ use crate::flipper::storage;
 /// Parsed metadata for a single BadUSB / BadKB script.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BadUsbEntry {
+    #[serde(deserialize_with = "crate::commands::path::deserialize_device_path_string")]
     pub path: String,
     pub name: String,
     /// "usb" for files under `/ext/badusb`, "kb" for `/ext/badkb`.

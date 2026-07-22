@@ -5,7 +5,8 @@
 //! the path-rebuild or exclusion semantics lands in one place — and adding the
 //! next library doesn't grow the duplication count.
 
-use crate::error::{FlipperError, Result};
+use crate::commands::path::DevicePath;
+use crate::error::Result;
 
 /// Progress callback fired after each parsed file. `scanned` ≤ `total`.
 /// Re-exported under the same alias each scanner already used so call sites
@@ -34,27 +35,19 @@ pub fn has_extension_ci(name: &str, ext_with_dot: &str) -> bool {
 /// dot segments keeps a malformed response from escaping the scanned root or
 /// writing outside the selected local download directory.
 pub fn validate_child_name(child: &str) -> Result<()> {
-    if child.is_empty()
-        || child == "."
-        || child == ".."
-        || child.contains('/')
-        || child.contains('\\')
-    {
-        return Err(FlipperError::Session(format!(
-            "Invalid child path returned by device: {child}"
-        )));
-    }
-    Ok(())
+    crate::commands::path::validate_child_name(child)
 }
 
 /// Concatenate `parent` and `child` with exactly one `/` between them.
 pub fn join_path(parent: &str, child: &str) -> Result<String> {
-    validate_child_name(child)?;
-    if parent.ends_with('/') {
-        Ok(format!("{parent}{child}"))
-    } else {
-        Ok(format!("{parent}/{child}"))
-    }
+    DevicePath::try_from(parent)?
+        .join_child(child)
+        .map(DevicePath::into_string)
+}
+
+/// Extend an already-validated device path with one device-provided basename.
+pub fn join_device_path(parent: &DevicePath, child: &str) -> Result<DevicePath> {
+    parent.join_child(child)
 }
 
 /// Last path segment, mirroring POSIX `basename`. Falls back to the whole
@@ -89,6 +82,15 @@ mod tests {
     fn join_path_handles_trailing_slash() {
         assert_eq!(join_path("/ext/nfc", "x.nfc").unwrap(), "/ext/nfc/x.nfc");
         assert_eq!(join_path("/ext/nfc/", "x.nfc").unwrap(), "/ext/nfc/x.nfc");
+    }
+
+    #[test]
+    fn typed_join_keeps_the_parent_validated() {
+        let parent = DevicePath::try_from("/ext//nfc").unwrap();
+        assert_eq!(
+            join_device_path(&parent, "x.nfc").unwrap().as_str(),
+            "/ext/nfc/x.nfc"
+        );
     }
 
     #[test]

@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { AlertTriangle, LayoutGrid, Upload } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -14,10 +13,10 @@ import {
 import { loadSettings, subscribeSettings } from "../../lib/settings";
 import { loadAppsCache, saveAppIcons, saveAppsCache } from "../../lib/appsCache";
 import { notify } from "../../lib/notify";
+import { commandErrorMessage, isCommandCancelled } from "../../lib/commandError";
 import { LibraryToolbar } from "./LibraryToolbar";
 import { LibraryTable } from "./LibraryTable";
 import { basename } from "../../lib/path";
-import type { AppScanProgress } from "../../types/apps";
 
 const DEFAULT_ROOT = "/ext/apps";
 
@@ -62,21 +61,6 @@ export function AppLibrary() {
       clearInjection(null);
     }
   }, [injection, clearInjection]);
-
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-    listen<AppScanProgress>("apps-scan-progress", (e) =>
-      setProgress(e.payload),
-    ).then((u) => {
-      if (cancelled) u();
-      else unlisten = u;
-    });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [setProgress]);
 
   useEffect(() => {
     if (!deviceUid) return;
@@ -147,7 +131,7 @@ export function AppLibrary() {
     setScanning(true);
     setProgress({ scanned: 0, total: 0, current_path: "" });
     try {
-      const list = await appsScan(roots, excludedDirs, entries);
+      const list = await appsScan(roots, excludedDirs, entries, setProgress);
       setEntries(list);
       if (deviceUid) {
         await saveAppsCache(deviceUid, list).catch(() => {});
@@ -155,9 +139,8 @@ export function AppLibrary() {
       }
       void notify("libraryScan", "App scan complete", `${list.length} apps indexed.`);
     } catch (e) {
-      const msg = (e as Error).message || String(e);
-      if (!msg.toLowerCase().includes("cancelled")) {
-        setError(`Scan failed: ${msg}`);
+      if (!isCommandCancelled(e)) {
+        setError(`Scan failed: ${commandErrorMessage(e, "apps_scan")}`);
       }
     } finally {
       setScanning(false);

@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { AlertTriangle, Nfc } from "lucide-react";
 import { useFlipperStore } from "../../store/useFlipperStore";
 import { nfcCancelScan, nfcParsePaths, nfcScan } from "../../lib/tauri";
@@ -7,11 +6,11 @@ import { loadSettings, subscribeSettings, updateSettings } from "../../lib/setti
 import { useLibraryPreScan } from "../../hooks/useLibraryPreScan";
 import { loadNfcCache, saveNfcCache } from "../../lib/nfcCache";
 import { notify } from "../../lib/notify";
+import { commandErrorMessage, isCommandCancelled } from "../../lib/commandError";
 import { useLibraryDrop } from "../../hooks/useLibraryDrop";
 import { LibraryDropOverlay } from "../ui/LibraryDropOverlay";
 import { LibraryToolbar } from "./LibraryToolbar";
 import { LibraryTable } from "./LibraryTable";
-import type { NfcScanProgress } from "../../types/nfc";
 
 const NFC_ROOT = "/ext/nfc";
 
@@ -51,21 +50,6 @@ export function NfcLibrary() {
     }
   }, [injection, clearInjection]);
 
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-    listen<NfcScanProgress>("nfc-scan-progress", (e) =>
-      setProgress(e.payload),
-    ).then((u) => {
-      if (cancelled) u();
-      else unlisten = u;
-    });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [setProgress]);
-
   // Rehydrate from disk on every deviceUid change — swaps in the new device's
   // cache (or clears, if it has never been scanned) so entries from a prior
   // device don't linger after reconnect to a different one.
@@ -96,7 +80,7 @@ export function NfcLibrary() {
         },
       );
       if (effective === null) return; // user closed the prescan modal
-      const list = await nfcScan(NFC_ROOT, effective, entries);
+      const list = await nfcScan(NFC_ROOT, effective, entries, setProgress);
       setEntries(list);
       if (deviceUid) {
         await saveNfcCache(deviceUid, list).catch(() => {});
@@ -104,9 +88,8 @@ export function NfcLibrary() {
       }
       void notify("libraryScan", "NFC scan complete", `${list.length} entries indexed.`);
     } catch (e) {
-      const msg = (e as Error).message || String(e);
-      if (!msg.toLowerCase().includes("cancelled")) {
-        setError(`Scan failed: ${msg}`);
+      if (!isCommandCancelled(e)) {
+        setError(`Scan failed: ${commandErrorMessage(e, "nfc_scan")}`);
       }
     } finally {
       setScanning(false);

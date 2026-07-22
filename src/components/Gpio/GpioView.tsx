@@ -29,6 +29,10 @@ import flipperOutlineUrl from "../../assets/flipper-outline.svg";
 import { GpioTopBar } from "./GpioTopBar";
 import { PinColumn } from "./PinColumn";
 import { InfoPinDetail, OtgPinDetail, RpcPinDetail } from "./PinDetail";
+import {
+  appendBoundedGpioSample,
+  type GpioSample,
+} from "./gpioHistory";
 
 const SAMPLE_HISTORY = 50;
 const DEFAULT_POLL_MS = 250;
@@ -48,6 +52,7 @@ interface RpcPinUiState {
 }
 
 type RpcPinMap = Record<GpioPinName, RpcPinUiState>;
+type GpioSampleMap = Record<GpioPinName, GpioSample[]>;
 
 const emptyPinMap = (): RpcPinMap =>
   Object.fromEntries(
@@ -64,6 +69,11 @@ const emptyPinMap = (): RpcPinMap =>
     ]),
   ) as RpcPinMap;
 
+const emptySampleMap = (): GpioSampleMap =>
+  Object.fromEntries(
+    RPC_GPIO_PINS.map((pin) => [pin, [] as GpioSample[]]),
+  ) as GpioSampleMap;
+
 /**
  * Main GPIO view.
  *
@@ -74,9 +84,8 @@ const emptyPinMap = (): RpcPinMap =>
  *   └──────────────────────────────────────────────┴─────────────────────────────┘
  *
  * State lives entirely in this component — the Zustand store is only used to
- * read connection status. Sample history for sparklines is held in a ref so
- * mid-interval reads don't trigger a re-render unless the value actually
- * changed.
+ * read connection status. Sample history is immutable state so every poll,
+ * including a repeated value, advances the sparkline deterministically.
  */
 export function GpioView() {
   const isConnected = useFlipperStore((s) => s.isConnected);
@@ -90,15 +99,8 @@ export function GpioView() {
   const [confirmingReset, setConfirmingReset] = useState<boolean>(false);
   const [pollIntervalMs, setPollIntervalMs] = useState<number>(DEFAULT_POLL_MS);
 
-  // Per-pin sample history — kept in a ref so we can append without
-  // re-rendering the entire pane on every poll. We only setState when the
-  // value actually changes.
-  const samplesRef = useRef<Record<GpioPinName, Array<0 | 1>>>(
-    Object.fromEntries(RPC_GPIO_PINS.map((p) => [p, [] as Array<0 | 1>])) as Record<
-      GpioPinName,
-      Array<0 | 1>
-    >,
-  );
+  // Immutable per-pin history makes repeated samples observable to React.
+  const [samples, setSamples] = useState<GpioSampleMap>(emptySampleMap);
   // Mounted-flag for sequencing teardown of async loops.
   const mountedRef = useRef(true);
   useEffect(() => {
@@ -134,9 +136,15 @@ export function GpioView() {
             mode: p.mode,
             value: p.value,
           };
+        }
+        return updated;
+      });
+      setSamples((prev) => {
+        const updated: GpioSampleMap = { ...prev };
+        for (const p of next.pins) {
           // Seed history with the snapshot value so the sparkline isn't
           // blank on first render.
-          samplesRef.current[p.pin] = p.value === null ? [] : [p.value];
+          updated[p.pin] = p.value === null ? [] : [p.value];
         }
         return updated;
       });
@@ -166,9 +174,7 @@ export function GpioView() {
       // Clear everything on disconnect — no stale state when the user
       // reconnects.
       setPins(emptyPinMap());
-      samplesRef.current = Object.fromEntries(
-        RPC_GPIO_PINS.map((p) => [p, [] as Array<0 | 1>]),
-      ) as Record<GpioPinName, Array<0 | 1>>;
+      setSamples(emptySampleMap());
       setOtg(false);
       setError(null);
       return;
@@ -210,13 +216,14 @@ export function GpioView() {
           try {
             const v = await gpioReadPin(pin);
             if (cancelled || !mountedRef.current) break;
-            // Append to history regardless (sparkline density), but only
-            // trigger a React re-render when the value actually changed.
-            const history = samplesRef.current[pin];
-            history.push(v);
-            if (history.length > SAMPLE_HISTORY) {
-              history.splice(0, history.length - SAMPLE_HISTORY);
-            }
+            setSamples((prev) => ({
+              ...prev,
+              [pin]: appendBoundedGpioSample(
+                prev[pin],
+                v,
+                SAMPLE_HISTORY,
+              ),
+            }));
             setPins((prev) => {
               if (prev[pin].value === v) return prev;
               return {
@@ -287,7 +294,7 @@ export function GpioView() {
               ...prev,
               [pin]: { ...prev[pin], value },
             }));
-            samplesRef.current[pin] = [value];
+            setSamples((prev) => ({ ...prev, [pin]: [value] }));
           } catch (e) {
             if (mountedRef.current) {
               setError(
@@ -382,11 +389,10 @@ export function GpioView() {
       try {
         const v = await gpioReadPin(pin);
         if (!mountedRef.current) return;
-        const history = samplesRef.current[pin];
-        history.push(v);
-        if (history.length > SAMPLE_HISTORY) {
-          history.splice(0, history.length - SAMPLE_HISTORY);
-        }
+        setSamples((prev) => ({
+          ...prev,
+          [pin]: appendBoundedGpioSample(prev[pin], v, SAMPLE_HISTORY),
+        }));
         setPins((prev) => ({ ...prev, [pin]: { ...prev[pin], value: v } }));
         markAction(pin, `Read ${v}`);
       } catch (e) {
@@ -526,7 +532,7 @@ export function GpioView() {
               pins={pins}
               otg={otg}
               busy={busy}
-              samplesRef={samplesRef}
+              samples={samples}
               onSetMode={handleSetMode}
               onSetPull={handleSetPull}
               onToggleWatch={handleToggleWatch}
@@ -561,7 +567,7 @@ function DetailPaneSwitch({
   pins,
   otg,
   busy,
-  samplesRef,
+  samples,
   onSetMode,
   onSetPull,
   onToggleWatch,
@@ -574,7 +580,7 @@ function DetailPaneSwitch({
   pins: RpcPinMap;
   otg: boolean;
   busy: boolean;
-  samplesRef: React.MutableRefObject<Record<GpioPinName, Array<0 | 1>>>;
+  samples: GpioSampleMap;
   onSetMode: (pin: GpioPinName, mode: GpioMode) => void;
   onSetPull: (pin: GpioPinName, pull: GpioPull) => void;
   onToggleWatch: (pin: GpioPinName) => void;
@@ -609,7 +615,7 @@ function DetailPaneSwitch({
         value={state.value}
         pull={state.pull}
         watching={state.watching}
-        samples={samplesRef.current[name]}
+        samples={samples[name]}
         lastAction={state.lastAction}
         lastActionAt={state.lastActionAt}
         busy={busy}

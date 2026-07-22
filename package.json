@@ -11,6 +11,8 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "typecheck": "tsc --noEmit",
+    "test:gpio-history": "node --test tests/gpio-history.test.mjs",
+    "test:settings": "node --test tests/settings.test.mjs",
     "release:prepare": "node scripts/prepare-release.mjs"
   },
   "dependencies": {

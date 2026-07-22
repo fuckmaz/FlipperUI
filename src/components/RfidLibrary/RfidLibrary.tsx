@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { AlertTriangle } from "lucide-react";
 import rfidIconSvg from "../../assets/icons/125.svg";
 import { useFlipperStore } from "../../store/useFlipperStore";
@@ -8,11 +7,11 @@ import { loadSettings, subscribeSettings, updateSettings } from "../../lib/setti
 import { useLibraryPreScan } from "../../hooks/useLibraryPreScan";
 import { loadRfidCache, saveRfidCache } from "../../lib/rfidCache";
 import { notify } from "../../lib/notify";
+import { commandErrorMessage, isCommandCancelled } from "../../lib/commandError";
 import { useLibraryDrop } from "../../hooks/useLibraryDrop";
 import { LibraryDropOverlay } from "../ui/LibraryDropOverlay";
 import { LibraryToolbar } from "./LibraryToolbar";
 import { LibraryTable } from "./LibraryTable";
-import type { RfidScanProgress } from "../../types/rfid";
 
 const RFID_ROOT = "/ext/lfrfid";
 
@@ -48,21 +47,6 @@ export function RfidLibrary() {
     }
   }, [injection, clearInjection]);
 
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-    listen<RfidScanProgress>("rfid-scan-progress", (e) =>
-      setProgress(e.payload),
-    ).then((u) => {
-      if (cancelled) u();
-      else unlisten = u;
-    });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [setProgress]);
-
   // Rehydrate from disk on every deviceUid change — swaps in the new device's
   // cache (or clears) so entries from a prior device don't linger.
   useEffect(() => {
@@ -92,7 +76,7 @@ export function RfidLibrary() {
         },
       );
       if (effective === null) return;
-      const list = await rfidScan(RFID_ROOT, effective, entries);
+      const list = await rfidScan(RFID_ROOT, effective, entries, setProgress);
       setEntries(list);
       if (deviceUid) {
         await saveRfidCache(deviceUid, list).catch(() => {});
@@ -100,9 +84,8 @@ export function RfidLibrary() {
       }
       void notify("libraryScan", "RFID scan complete", `${list.length} entries indexed.`);
     } catch (e) {
-      const msg = (e as Error).message || String(e);
-      if (!msg.toLowerCase().includes("cancelled")) {
-        setError(`Scan failed: ${msg}`);
+      if (!isCommandCancelled(e)) {
+        setError(`Scan failed: ${commandErrorMessage(e, "rfid_scan")}`);
       }
     } finally {
       setScanning(false);

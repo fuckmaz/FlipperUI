@@ -59,7 +59,7 @@ interface FlipperStore {
   subghzError: string | null;
   /** Path of the .sub file currently being transmitted, or null when idle. */
   subghzTransmittingPath: string | null;
-  /** Starred .sub paths for the current device. Hydrated from cache. */
+  /** Stable starred signal identities for the current device. */
   subghzFavorites: string[];
 
   // Infrared library
@@ -123,7 +123,7 @@ interface FlipperStore {
   setSubghzError: (error: string | null) => void;
   setSubghzTransmittingPath: (path: string | null) => void;
   setSubghzFavorites: (favorites: string[]) => void;
-  toggleSubghzFavorite: (path: string) => void;
+  toggleSubghzFavorite: (identity: string) => void;
   setIrEntries: (entries: IrEntry[]) => void;
   setIrScanning: (scanning: boolean) => void;
   setIrProgress: (progress: IrScanProgress | null) => void;
@@ -268,11 +268,11 @@ export const useFlipperStore = create<FlipperStore>((set) => ({
   setSubghzTransmittingPath: (subghzTransmittingPath) =>
     set({ subghzTransmittingPath }),
   setSubghzFavorites: (subghzFavorites) => set({ subghzFavorites }),
-  toggleSubghzFavorite: (path) =>
+  toggleSubghzFavorite: (identity) =>
     set((s) => ({
-      subghzFavorites: s.subghzFavorites.includes(path)
-        ? s.subghzFavorites.filter((p) => p !== path)
-        : [...s.subghzFavorites, path],
+      subghzFavorites: s.subghzFavorites.includes(identity)
+        ? s.subghzFavorites.filter((favorite) => favorite !== identity)
+        : [...s.subghzFavorites, identity],
     })),
   setIrEntries: (irEntries) => set({ irEntries }),
   setIrScanning: (irScanning) => set({ irScanning }),

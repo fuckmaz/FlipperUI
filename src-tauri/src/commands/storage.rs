@@ -1,104 +1,126 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{ipc::Channel, AppHandle, Emitter, State};
 
-use crate::commands::client::{is_fatal_transport_error, with_client};
-use crate::commands::path::validate_path;
+use crate::commands::client::{
+    connection_handle, execute_connection, retire_connection_owner, with_connection,
+};
+use crate::commands::path::{validate_path, DevicePath};
 use crate::error::{FlipperError, Result};
 use crate::flipper::client::FlipperClient;
-use crate::flipper::diag;
 use crate::flipper::library_walk;
 use crate::flipper::storage;
+use crate::operation::{require_cancelled, OperationName, ProgressTracker};
 use crate::pb_storage;
-use crate::state::{AppState, ConnectionMode};
+use crate::state::AppState;
 
-fn join_remote(dir: &str, name: &str) -> String {
-    if dir.ends_with('/') {
-        format!("{dir}{name}")
-    } else {
-        format!("{dir}/{name}")
-    }
+fn join_remote(dir: &str, name: &str) -> Result<String> {
+    library_walk::join_path(dir, name)
 }
 
-fn begin_transfer(generation: &AtomicU64) -> u64 {
-    generation.fetch_add(1, Ordering::Relaxed) + 1
+const TEMP_CREATE_ATTEMPTS: u32 = 64;
+
+struct OwnedTempFile {
+    path: PathBuf,
+    file: Option<File>,
+    committed: bool,
 }
 
-fn transfer_cancelled(cancelled_generation: &AtomicU64, generation: u64) -> bool {
-    cancelled_generation.load(Ordering::Relaxed) == generation
-}
-
-fn upload_progress_pct(sent: usize, total: usize) -> u32 {
-    if total == 0 {
-        return 100;
-    }
-    if sent >= total {
-        return 99;
-    }
-    ((sent * 100 / total) as u32).clamp(1, 99)
-}
-
-fn with_transfer_client<T>(
-    mode_mutex: &Arc<Mutex<ConnectionMode>>,
-    client_mutex: &Arc<Mutex<Option<FlipperClient>>>,
-    ble_cancel_tx: &Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
-    app: &AppHandle,
-    f: impl FnOnce(&mut FlipperClient) -> Result<T>,
-) -> Result<T> {
-    let result = with_client(mode_mutex, client_mutex, f);
-    if let Err(e) = &result {
-        if is_fatal_transfer_error(e) {
-            tracing::warn!("tearing down connection after transfer RPC failure: {e}");
-            diag::log_event("TransferConnectionTornDown", e.to_string());
-            if let Ok(mut guard) = client_mutex.lock() {
-                *guard = None;
-            }
-            if let Ok(mut tx_guard) = ble_cancel_tx.lock() {
-                if let Some(tx) = tx_guard.take() {
-                    let _ = tx.send(());
+impl OwnedTempFile {
+    fn allocate(target: &Path, operation_id: u64) -> Result<Self> {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let base = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("download");
+        for attempt in 0..TEMP_CREATE_ATTEMPTS {
+            let path =
+                target.with_file_name(format!(".{base}.flipperui-{operation_id}-{attempt}.part"));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        file: Some(file),
+                        committed: false,
+                    })
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
             }
-            let _ = app.emit("flipper-disconnected", e.to_string());
+        }
+        Err(FlipperError::ConnectionBusy)
+    }
+
+    fn write_all(&mut self, data: &[u8]) -> Result<()> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| FlipperError::Internal("temporary file is closed".into()))?
+            .write_all(data)?;
+        Ok(())
+    }
+
+    fn commit(mut self, target: &Path) -> Result<()> {
+        if let Some(mut file) = self.file.take() {
+            file.flush()?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&self.path, target)?;
+        self.committed = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for OwnedTempFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
         }
     }
-    result
 }
 
-fn is_fatal_transfer_error(e: &FlipperError) -> bool {
-    match e {
-        FlipperError::Serial(_) => true,
-        FlipperError::Io(io) => !matches!(
-            io.kind(),
-            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-        ),
-        FlipperError::Decode(_) | FlipperError::Encode(_) => true,
-        _ => false,
-    }
-}
-
-fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    let tmp = temp_path_for(path);
+fn write_atomic(path: &Path, data: &[u8], operation_id: u64) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        FlipperError::Io(e)
-    })
+    let mut temporary = OwnedTempFile::allocate(path, operation_id)?;
+    temporary.write_all(data)?;
+    temporary.commit(path)
 }
 
-fn temp_path_for(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_else(|| ".flipperui-download".into());
-    name.push(".part");
-    path.with_file_name(name)
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferProgress {
+    operation_id: u64,
+    completed: u64,
+    total: u64,
+    percent: u32,
+}
+
+fn send_transfer_progress(
+    channel: &Channel<TransferProgress>,
+    operation_id: u64,
+    snapshot: crate::operation::ProgressSnapshot,
+) {
+    let _ = channel.send(TransferProgress {
+        operation_id,
+        completed: snapshot.completed,
+        total: snapshot.total,
+        percent: snapshot.percent,
+    });
 }
 
 /// Mirror of pb_storage::File for the frontend, with base64-encoded data.
@@ -123,34 +145,22 @@ impl From<pb_storage::File> for FileEntry {
 }
 
 #[tauri::command]
-pub async fn storage_list(path: String, state: State<'_, AppState>) -> Result<Vec<FileEntry>> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
+pub async fn storage_list(path: DevicePath, state: State<'_, AppState>) -> Result<Vec<FileEntry>> {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         validate_path(&path)?;
-        with_client(&mode_mutex, &client_mutex, |c| {
-            storage::storage_list(c, &path)
-                .map(|files| files.into_iter().map(FileEntry::from).collect())
-        })
+        storage::storage_list(client, &path)
+            .map(|files| files.into_iter().map(FileEntry::from).collect())
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 #[tauri::command]
-pub async fn storage_stat(path: String, state: State<'_, AppState>) -> Result<FileEntry> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
+pub async fn storage_stat(path: DevicePath, state: State<'_, AppState>) -> Result<FileEntry> {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         validate_path(&path)?;
-        with_client(&mode_mutex, &client_mutex, |c| {
-            storage::storage_stat(c, &path).map(FileEntry::from)
-        })
+        storage::storage_stat(client, &path).map(FileEntry::from)
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 /// Read a file from the Flipper. Returns base64-encoded bytes to avoid
@@ -158,191 +168,212 @@ pub async fn storage_stat(path: String, state: State<'_, AppState>) -> Result<Fi
 /// Emits `"download-progress"` events (u32 0–100) to the frontend after each chunk.
 #[tauri::command]
 pub async fn storage_read(
-    path: String,
+    path: DevicePath,
     state: State<'_, AppState>,
-    app: AppHandle,
+    on_progress: Channel<TransferProgress>,
 ) -> Result<String> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-    let generation = begin_transfer(&state.transfer_generation);
-    let cancelled_generation = Arc::clone(&state.transfer_cancelled_generation);
+    let operation = state.operations.begin(OperationName::Transfer)?;
+    let operation_id = operation.id();
+    let cancelled = operation.cancel_token();
+    let tracker = RefCell::new(ProgressTracker::default());
+    send_transfer_progress(
+        &on_progress,
+        operation_id,
+        tracker.borrow_mut().update(0, 0),
+    );
 
-    tauri::async_runtime::spawn_blocking(move || {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
+        let _operation = operation;
         validate_path(&path)?;
-        with_client(&mode_mutex, &client_mutex, |c| {
-            let data = storage::storage_read(
-                c,
-                &path,
-                |received, total| {
-                    let pct = (received * 100)
-                        .checked_div(total)
-                        .map(|v| v as u32)
-                        .unwrap_or(0);
-                    let _ = app.emit("download-progress", pct);
-                },
-                || transfer_cancelled(&cancelled_generation, generation),
-            )?;
-            Ok(base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                &data,
-            ))
-        })
+        let data = storage::storage_read(
+            client,
+            &path,
+            |received, total| {
+                let snapshot = tracker.borrow_mut().update(received as u64, total as u64);
+                send_transfer_progress(&on_progress, operation_id, snapshot);
+            },
+            || cancelled.load(Ordering::Acquire),
+        )?;
+        let total = data.len() as u64;
+        let snapshot = tracker.borrow_mut().finish(total, total);
+        send_transfer_progress(&on_progress, operation_id, snapshot);
+        Ok(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &data,
+        ))
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 /// Write a file to the Flipper. `data` is base64-encoded.
 /// Emits `"upload-progress"` events (u32 0–100) to the frontend after each chunk.
 #[tauri::command]
 pub async fn storage_write(
-    path: String,
+    path: DevicePath,
     data: String,
     state: State<'_, AppState>,
-    app: AppHandle,
+    on_progress: Channel<TransferProgress>,
 ) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-    let ble_cancel_tx = Arc::clone(&state.ble_cancel_tx);
-    let generation = begin_transfer(&state.transfer_generation);
-    let cancelled_generation = Arc::clone(&state.transfer_cancelled_generation);
+    let operation = state.operations.begin(OperationName::Transfer)?;
+    let operation_id = operation.id();
+    let cancelled = operation.cancel_token();
+    let tracker = RefCell::new(ProgressTracker::default());
+    send_transfer_progress(
+        &on_progress,
+        operation_id,
+        tracker.borrow_mut().update(0, 0),
+    );
 
-    tauri::async_runtime::spawn_blocking(move || {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
+        let _operation = operation;
         validate_path(&path)?;
         let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)
             .map_err(|e| FlipperError::Session(format!("base64 decode error: {e}")))?;
 
-        let app_for_progress = app.clone();
-        let result = with_transfer_client(&mode_mutex, &client_mutex, &ble_cancel_tx, &app, |c| {
-            storage::storage_write(
-                c,
-                &path,
-                &bytes,
-                |sent, total| {
-                    let pct = upload_progress_pct(sent, total);
-                    let _ = app_for_progress.emit("upload-progress", pct);
-                },
-                || transfer_cancelled(&cancelled_generation, generation),
-            )
-        });
+        let result = storage::storage_write(
+            client,
+            &path,
+            &bytes,
+            |sent, total| {
+                let snapshot = tracker.borrow_mut().update(sent as u64, total as u64);
+                send_transfer_progress(&on_progress, operation_id, snapshot);
+            },
+            || cancelled.load(Ordering::Acquire),
+        );
         if result.is_ok() {
-            let _ = app.emit("upload-progress", 100);
+            let total = bytes.len() as u64;
+            let snapshot = tracker.borrow_mut().finish(total, total);
+            send_transfer_progress(&on_progress, operation_id, snapshot);
         }
         result
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 /// Read a remote Flipper file and persist it directly to a local filesystem
 /// path. This avoids base64-encoding the payload through the webview.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn storage_read_to_local(
-    path: String,
+    path: DevicePath,
     local_path: String,
     state: State<'_, AppState>,
-    app: AppHandle,
+    on_progress: Channel<TransferProgress>,
 ) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-    let generation = begin_transfer(&state.transfer_generation);
-    let cancelled_generation = Arc::clone(&state.transfer_cancelled_generation);
+    let operation = state.operations.begin(OperationName::Transfer)?;
+    let operation_id = operation.id();
+    let cancelled = operation.cancel_token();
+    let tracker = Arc::new(std::sync::Mutex::new(ProgressTracker::default()));
+    send_transfer_progress(
+        &on_progress,
+        operation_id,
+        tracker
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .update(0, 0),
+    );
+    let progress_in_job = on_progress.clone();
+    let tracker_in_job = Arc::clone(&tracker);
+    let cancelled_in_job = Arc::clone(&cancelled);
 
-    tauri::async_runtime::spawn_blocking(move || {
+    let data = with_connection(Arc::clone(&state.connection_owner), move |client| {
         validate_path(&path)?;
-        let data = with_client(&mode_mutex, &client_mutex, |c| {
-            storage::storage_read(
-                c,
-                &path,
-                |received, total| {
-                    let pct = (received * 100)
-                        .checked_div(total)
-                        .map(|v| v as u32)
-                        .unwrap_or(0);
-                    let _ = app.emit("download-progress", pct);
-                },
-                || transfer_cancelled(&cancelled_generation, generation),
-            )
-        })?;
-        write_atomic(&PathBuf::from(local_path), &data)?;
+        storage::storage_read(
+            client,
+            &path,
+            |received, total| {
+                let snapshot = tracker_in_job
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .update(received as u64, total as u64);
+                send_transfer_progress(&progress_in_job, operation_id, snapshot);
+            },
+            || cancelled_in_job.load(Ordering::Acquire),
+        )
+    })
+    .await?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(FlipperError::TransferCancelled);
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation = operation;
+        write_atomic(&PathBuf::from(local_path), &data, operation_id)?;
+        let total = data.len() as u64;
+        let snapshot = tracker
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .finish(total, total);
+        send_transfer_progress(&on_progress, operation_id, snapshot);
         Ok(())
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
+    .map_err(|error| FlipperError::Internal(error.to_string()))?
 }
 
 /// Read a local filesystem path and upload it directly to the Flipper without
 /// base64-encoding the payload through the webview.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn storage_write_from_local(
-    path: String,
+    path: DevicePath,
     local_path: String,
     state: State<'_, AppState>,
-    app: AppHandle,
+    on_progress: Channel<TransferProgress>,
 ) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-    let ble_cancel_tx = Arc::clone(&state.ble_cancel_tx);
-    let generation = begin_transfer(&state.transfer_generation);
-    let cancelled_generation = Arc::clone(&state.transfer_cancelled_generation);
+    let operation = state.operations.begin(OperationName::Transfer)?;
+    let operation_id = operation.id();
+    let cancelled = operation.cancel_token();
+    let tracker = RefCell::new(ProgressTracker::default());
+    send_transfer_progress(
+        &on_progress,
+        operation_id,
+        tracker.borrow_mut().update(0, 0),
+    );
 
-    tauri::async_runtime::spawn_blocking(move || {
-        validate_path(&path)?;
-        let bytes = std::fs::read(local_path)?;
-        let app_for_progress = app.clone();
-        let result = with_transfer_client(&mode_mutex, &client_mutex, &ble_cancel_tx, &app, |c| {
-            storage::storage_write(
-                c,
-                &path,
-                &bytes,
-                |sent, total| {
-                    let pct = upload_progress_pct(sent, total);
-                    let _ = app_for_progress.emit("upload-progress", pct);
-                },
-                || transfer_cancelled(&cancelled_generation, generation),
-            )
-        });
+    validate_path(&path)?;
+    let bytes = tauri::async_runtime::spawn_blocking(move || std::fs::read(local_path))
+        .await
+        .map_err(|error| FlipperError::Internal(error.to_string()))??;
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
+        let _operation = operation;
+        let result = storage::storage_write(
+            client,
+            &path,
+            &bytes,
+            |sent, total| {
+                let snapshot = tracker.borrow_mut().update(sent as u64, total as u64);
+                send_transfer_progress(&on_progress, operation_id, snapshot);
+            },
+            || cancelled.load(Ordering::Acquire),
+        );
         if result.is_ok() {
-            let _ = app.emit("upload-progress", 100);
+            let total = bytes.len() as u64;
+            let snapshot = tracker.borrow_mut().finish(total, total);
+            send_transfer_progress(&on_progress, operation_id, snapshot);
         }
         result
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 #[tauri::command]
-pub async fn storage_mkdir(path: String, state: State<'_, AppState>) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
+pub async fn storage_mkdir(path: DevicePath, state: State<'_, AppState>) -> Result<()> {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         validate_path(&path)?;
-        with_client(&mode_mutex, &client_mutex, |c| {
-            storage::storage_mkdir(c, &path)
-        })
+        storage::storage_mkdir(client, &path)
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 #[tauri::command]
 pub async fn storage_delete(
-    path: String,
+    path: DevicePath,
     recursive: bool,
     state: State<'_, AppState>,
 ) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         validate_path(&path)?;
-        with_client(&mode_mutex, &client_mutex, |c| {
-            storage::storage_delete(c, &path, recursive)
-        })
+        storage::storage_delete(client, &path, recursive)
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 const MAX_DELETE_BATCH_ITEMS: usize = 1_000;
@@ -350,13 +381,13 @@ const MAX_DELETE_BATCH_ITEMS: usize = 1_000;
 /// One validated delete operation submitted by the file browser.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct StorageDeleteTarget {
-    pub path: String,
+    pub path: DevicePath,
     pub recursive: bool,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct StorageDeleteFailure {
-    pub path: String,
+    pub path: DevicePath,
     pub recursive: bool,
     pub error: String,
     /// True when the transport was torn down and no later item was attempted.
@@ -374,32 +405,15 @@ pub struct StorageDeleteManyResult {
 /// Validate the complete batch before acquiring the client or issuing any RPC.
 /// This prevents a malformed later target from being discovered only after
 /// earlier entries have already been removed.
-fn validate_destructive_path(path: &str) -> Result<()> {
-    validate_path(path)?;
-
-    // Destructive operations deliberately use a stricter grammar than normal
-    // storage reads. Empty or dot components can spell a storage root (for
-    // example `/ext/`, `/ext/.`, or `/ext//`) or create ambiguous aliases for
-    // another target. Require a root plus at least one ordinary child segment.
-    let mut components = path.split('/');
-    if components.next() != Some("") {
-        return Err(FlipperError::Session("Delete path must be absolute".into()));
-    }
-    let components: Vec<&str> = components.collect();
-    if components.len() < 2 {
-        return Err(FlipperError::Session(
-            "Deleting a storage root is not allowed".into(),
-        ));
-    }
-    if components.iter().any(|component| component.is_empty()) {
-        return Err(FlipperError::Session(
-            "Delete path cannot contain empty components".into(),
-        ));
-    }
-    if components.contains(&".") {
-        return Err(FlipperError::Session(
-            "Delete path cannot contain dot components".into(),
-        ));
+fn validate_destructive_path(path: &DevicePath) -> Result<()> {
+    // DevicePath has already normalized aliases such as `/ext//a` and
+    // `/ext/./a`, so the only remaining destructive boundary is protecting
+    // the three storage roots themselves.
+    if path.is_root() {
+        return Err(FlipperError::InvalidDevicePath {
+            path: path.to_string(),
+            reason: "deleting a storage root is not allowed".into(),
+        });
     }
     Ok(())
 }
@@ -420,10 +434,10 @@ fn validate_delete_many_targets(targets: &[StorageDeleteTarget]) -> Result<()> {
     for target in targets {
         validate_destructive_path(&target.path)?;
         if !unique_paths.insert(target.path.as_str()) {
-            return Err(FlipperError::Session(format!(
-                "Delete batch contains duplicate path: {}",
-                target.path
-            )));
+            return Err(FlipperError::InvalidDevicePath {
+                path: target.path.to_string(),
+                reason: "delete batch contains a duplicate path".into(),
+            });
         }
     }
     Ok(())
@@ -449,7 +463,7 @@ fn execute_delete_many(
         match delete(&target) {
             Ok(()) => result.deleted.push(target),
             Err(error) => {
-                let fatal = is_fatal_transport_error(&error);
+                let fatal = crate::error::is_fatal_transport_error(&error);
                 let error = error.to_string();
                 result.failed.push(StorageDeleteFailure {
                     path: target.path,
@@ -483,73 +497,50 @@ pub async fn storage_delete_many(
 ) -> Result<StorageDeleteManyResult> {
     validate_delete_many_targets(&targets)?;
 
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-    let ble_cancel_tx = Arc::clone(&state.ble_cancel_tx);
-
-    tauri::async_runtime::spawn_blocking(move || {
-        {
-            let mode = mode_mutex
-                .lock()
-                .map_err(|_| FlipperError::Internal("Connection mode lock poisoned".into()))?;
-            if *mode == ConnectionMode::Cli {
-                return Err(FlipperError::CliModeActive);
-            }
-        }
-
-        let mut client_guard = client_mutex
-            .lock()
-            .map_err(|_| FlipperError::Internal("Client lock poisoned".into()))?;
-        let client = client_guard.as_mut().ok_or(FlipperError::NotConnected)?;
+    let owner = Arc::clone(&state.connection_owner);
+    let handle = connection_handle(&owner)?;
+    let result = execute_connection(&handle, move |client| {
         let result = execute_delete_many(targets, |target| {
             storage::storage_delete(client, &target.path, target.recursive)
         });
-
-        let fatal_reason = result.stopped_reason.clone();
-        if fatal_reason.is_some() {
-            // Clear the client while this batch still owns the lock so no RPC
-            // can slip in between the fatal error and connection teardown.
-            *client_guard = None;
-        }
-        drop(client_guard);
-
-        if let Some(reason) = fatal_reason {
-            tracing::warn!("tearing down connection after delete batch failure: {reason}");
-            diag::log_event("DeleteBatchConnectionTornDown", reason.clone());
-            if let Ok(mut tx_guard) = ble_cancel_tx.lock() {
-                if let Some(tx) = tx_guard.take() {
-                    let _ = tx.send(());
-                }
-            }
-            let _ = app.emit("flipper-disconnected", &reason);
-        }
-
         Ok(result)
     })
-    .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
+    .await?;
+
+    if let Some(reason) = result.stopped_reason.as_ref() {
+        tracing::warn!("tearing down connection after delete batch failure: {reason}");
+        let lifecycle = Arc::clone(&state.connection_lifecycle);
+        let _lifecycle = lifecycle.lock().await;
+        if retire_connection_owner(&owner, &handle) {
+            let _ = handle.shutdown().await;
+            if let Some(cancel) = state
+                .ble_cancel_tx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                let _ = cancel.send(());
+            }
+            let _ = app.emit("flipper-disconnected", reason);
+        }
+    }
+    Ok(result)
 }
 
 /// Rename (or move) a file/directory on the Flipper.
 /// Both `old_path` and `new_path` must be absolute paths on the same storage.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn storage_rename(
-    old_path: String,
-    new_path: String,
+    old_path: DevicePath,
+    new_path: DevicePath,
     state: State<'_, AppState>,
 ) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         validate_path(&old_path)?;
         validate_path(&new_path)?;
-        with_client(&mode_mutex, &client_mutex, |c| {
-            storage::storage_rename(c, &old_path, &new_path)
-        })
+        storage::storage_rename(client, &old_path, &new_path)
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 /// Storage space info for a path (e.g. "/ext" or "/int").
@@ -560,64 +551,46 @@ pub struct StorageInfo {
 }
 
 #[tauri::command]
-pub async fn storage_du(path: String, state: State<'_, AppState>) -> Result<u64> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
+pub async fn storage_du(path: DevicePath, state: State<'_, AppState>) -> Result<u64> {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         validate_path(&path)?;
-        with_client(&mode_mutex, &client_mutex, |c| {
-            storage::storage_du(c, &path)
-        })
+        storage::storage_du(client, &path)
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 #[tauri::command]
-pub async fn storage_info(path: String, state: State<'_, AppState>) -> Result<StorageInfo> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
+pub async fn storage_info(path: DevicePath, state: State<'_, AppState>) -> Result<StorageInfo> {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         validate_path(&path)?;
-        with_client(&mode_mutex, &client_mutex, |c| {
-            let (total, free) = storage::storage_info(c, &path)?;
-            Ok(StorageInfo {
-                total_space: total,
-                free_space: free,
-            })
+        let (total, free) = storage::storage_info(client, &path)?;
+        Ok(StorageInfo {
+            total_space: total,
+            free_space: free,
         })
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 /// Get the modification timestamp of a file (Unix epoch seconds).
 #[tauri::command]
-pub async fn storage_timestamp(path: String, state: State<'_, AppState>) -> Result<u32> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
+pub async fn storage_timestamp(path: DevicePath, state: State<'_, AppState>) -> Result<u32> {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         validate_path(&path)?;
-        with_client(&mode_mutex, &client_mutex, |c| {
-            storage::storage_timestamp(c, &path)
-        })
+        storage::storage_timestamp(client, &path)
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
-/// Cancel an in-progress transfer (read or write).
-/// Marks the active transfer generation as cancelled.
+/// Cancel exactly the transfer identified by its invocation-scoped progress
+/// channel. Retired IDs are rejected and cannot affect a replacement.
 #[tauri::command]
-pub fn cancel_transfer(state: State<AppState>) -> Result<()> {
-    let generation = state.transfer_generation.load(Ordering::Relaxed);
-    state
-        .transfer_cancelled_generation
-        .store(generation, Ordering::Relaxed);
-    Ok(())
+pub fn cancel_transfer(operation_id: u64, state: State<AppState>) -> Result<()> {
+    require_cancelled(
+        state
+            .operations
+            .cancel(OperationName::Transfer, operation_id),
+    )
 }
 
 /// Sum the byte size of every file under `path`, recursively. Used as the
@@ -629,7 +602,7 @@ fn sum_tree_bytes(client: &mut FlipperClient, path: &str) -> Result<u64> {
         let entries = storage::storage_list(client, &dir)?;
         for e in entries {
             library_walk::validate_child_name(&e.name)?;
-            let sub = join_remote(&dir, &e.name);
+            let sub = join_remote(&dir, &e.name)?;
             if e.r#type == 1 {
                 queue.push(sub);
             } else {
@@ -644,37 +617,35 @@ fn sum_tree_bytes(client: &mut FlipperClient, path: &str) -> Result<u64> {
 /// fully-resolved destination — directory contents land directly inside it,
 /// not under a wrapper folder. The wrapper is created by the caller so that
 /// behaviour is explicit at the command boundary.
+#[derive(Clone, Copy)]
+struct DownloadDirContext<'a> {
+    total_bytes: u64,
+    operation_id: u64,
+    on_progress: &'a dyn Fn(u64, u64),
+    cancelled: &'a dyn Fn() -> bool,
+}
+
 fn download_dir_recursive(
     client: &mut FlipperClient,
     remote_dir: &str,
     local_dir: &Path,
-    total_bytes: u64,
     bytes_done: &mut u64,
-    on_progress: &dyn Fn(u64, u64),
-    cancelled: &dyn Fn() -> bool,
+    context: DownloadDirContext<'_>,
 ) -> Result<()> {
-    if cancelled() {
+    if (context.cancelled)() {
         return Err(FlipperError::TransferCancelled);
     }
     std::fs::create_dir_all(local_dir)?;
     let entries = storage::storage_list(client, remote_dir)?;
     for e in entries {
-        if cancelled() {
+        if (context.cancelled)() {
             return Err(FlipperError::TransferCancelled);
         }
         library_walk::validate_child_name(&e.name)?;
-        let remote_sub = join_remote(remote_dir, &e.name);
+        let remote_sub = join_remote(remote_dir, &e.name)?;
         let local_sub = local_dir.join(&e.name);
         if e.r#type == 1 {
-            download_dir_recursive(
-                client,
-                &remote_sub,
-                &local_sub,
-                total_bytes,
-                bytes_done,
-                on_progress,
-                cancelled,
-            )?;
+            download_dir_recursive(client, &remote_sub, &local_sub, bytes_done, context)?;
         } else {
             let start = *bytes_done;
             let file_size = e.size as u64;
@@ -683,13 +654,13 @@ fn download_dir_recursive(
                 &remote_sub,
                 |received, _| {
                     let cumulative = start.saturating_add(received as u64);
-                    on_progress(cumulative.min(total_bytes), total_bytes);
+                    (context.on_progress)(cumulative.min(context.total_bytes), context.total_bytes);
                 },
-                cancelled,
+                context.cancelled,
             )?;
-            write_atomic(&local_sub, &data)?;
+            write_atomic(&local_sub, &data, context.operation_id)?;
             *bytes_done = bytes_done.saturating_add(file_size);
-            on_progress(*bytes_done, total_bytes);
+            (context.on_progress)(*bytes_done, context.total_bytes);
         }
     }
     Ok(())
@@ -707,83 +678,92 @@ fn download_dir_recursive(
 /// across many files.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn storage_read_dir_to_local(
-    path: String,
+    path: DevicePath,
     local_path: String,
     state: State<'_, AppState>,
-    app: AppHandle,
+    on_progress: Channel<TransferProgress>,
 ) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-    let generation = begin_transfer(&state.transfer_generation);
-    let cancelled_generation = Arc::clone(&state.transfer_cancelled_generation);
+    let operation = state.operations.begin(OperationName::Transfer)?;
+    let operation_id = operation.id();
+    let cancelled = operation.cancel_token();
+    let tracker = RefCell::new(ProgressTracker::default());
+    send_transfer_progress(
+        &on_progress,
+        operation_id,
+        tracker.borrow_mut().update(0, 0),
+    );
 
-    tauri::async_runtime::spawn_blocking(move || {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
+        let _operation = operation;
         validate_path(&path)?;
         let local_root = PathBuf::from(local_path);
-        with_client(&mode_mutex, &client_mutex, |c| {
-            let total_bytes = sum_tree_bytes(c, &path)?;
-            // Emit 0% up front so the bar shows even before the first chunk
-            // arrives (the pre-walk is fast but not instant on big trees).
-            let _ = app.emit("download-progress", 0u32);
+        let total_bytes = sum_tree_bytes(client, &path)?;
+        let snapshot = tracker.borrow_mut().update(0, total_bytes);
+        send_transfer_progress(&on_progress, operation_id, snapshot);
 
-            let mut bytes_done: u64 = 0;
-            let on_progress = |done: u64, total: u64| {
-                let pct = done
-                    .saturating_mul(100)
-                    .checked_div(total)
-                    .map(|v| v.min(100) as u32)
-                    .unwrap_or(100);
-                let _ = app.emit("download-progress", pct);
-            };
+        let mut bytes_done: u64 = 0;
+        let report = |done: u64, total: u64| {
+            let snapshot = tracker.borrow_mut().update(done, total);
+            send_transfer_progress(&on_progress, operation_id, snapshot);
+        };
 
-            let is_cancelled = || transfer_cancelled(&cancelled_generation, generation);
-            download_dir_recursive(
-                c,
-                &path,
-                &local_root,
+        let is_cancelled = || cancelled.load(Ordering::Acquire);
+        download_dir_recursive(
+            client,
+            &path,
+            &local_root,
+            &mut bytes_done,
+            DownloadDirContext {
                 total_bytes,
-                &mut bytes_done,
-                &on_progress,
-                &is_cancelled,
-            )?;
+                operation_id,
+                on_progress: &report,
+                cancelled: &is_cancelled,
+            },
+        )?;
 
-            // Empty folders: ensure final 100% lands so the UI clears cleanly.
-            let _ = app.emit("download-progress", 100u32);
-            Ok(())
-        })
+        let snapshot = tracker.borrow_mut().finish(bytes_done, total_bytes);
+        send_transfer_progress(&on_progress, operation_id, snapshot);
+        Ok(())
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 /// Extract a .tar archive on the Flipper.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn storage_tar_extract(
-    tar_path: String,
-    out_path: String,
+    tar_path: DevicePath,
+    out_path: DevicePath,
     state: State<'_, AppState>,
 ) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         validate_path(&tar_path)?;
         validate_path(&out_path)?;
-        with_client(&mode_mutex, &client_mutex, |c| {
-            storage::storage_tar_extract(c, &tar_path, &out_path)
-        })
+        storage::storage_tar_extract(client, &tar_path, &out_path)
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn test_dir(label: &str) -> PathBuf {
+        let id = TEST_DIR_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "flipperui-storage-{label}-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     fn target(path: &str) -> StorageDeleteTarget {
         StorageDeleteTarget {
-            path: path.to_string(),
+            path: DevicePath::try_from(path).unwrap(),
             recursive: false,
         }
     }
@@ -791,32 +771,29 @@ mod tests {
     #[test]
     fn delete_batch_validation_rejects_every_invalid_batch_before_execution() {
         assert!(validate_delete_many_targets(&[]).is_err());
-        for invalid_path in [
-            "/ext",
-            "/ext/",
-            "/ext/.",
-            "/ext//",
-            "/int",
-            "/int/.",
-            "/int//folder",
-            "/any",
-            "/any//",
-            "/any/./folder",
-            "/ext/folder/",
-            "/ext/folder//child",
-            "/ext/../int/secret",
-        ] {
+        for root_alias in ["/ext", "/ext/", "/ext/.", "/ext//", "/int", "/any//"] {
             assert!(
-                validate_delete_many_targets(&[target(invalid_path)]).is_err(),
-                "should reject destructive path {invalid_path}"
+                validate_delete_many_targets(&[target(root_alias)]).is_err(),
+                "should reject storage root {root_alias}"
             );
         }
+        for invalid_path in ["/ext/../int/secret", "/tmp/file", "/ext\\file"] {
+            let payload = serde_json::json!({ "path": invalid_path, "recursive": false });
+            assert!(
+                serde_json::from_value::<StorageDeleteTarget>(payload).is_err(),
+                "boundary should reject destructive path {invalid_path}"
+            );
+        }
+
+        // Harmless aliases normalize before duplicate detection, so the same
+        // device entry cannot be deleted twice under different spellings.
+        assert!(validate_delete_many_targets(&[target("/ext/a"), target("/ext//./a"),]).is_err());
         assert!(validate_delete_many_targets(&[target("/ext/a"), target("/ext/a"),]).is_err());
 
         assert!(validate_delete_many_targets(&[
             target("/ext/a"),
             StorageDeleteTarget {
-                path: "/int/folder".into(),
+                path: DevicePath::try_from("/int/folder").unwrap(),
                 recursive: true,
             },
         ])
@@ -828,8 +805,8 @@ mod tests {
         let targets = vec![target("/ext/a"), target("/ext/b"), target("/ext/c")];
         let mut attempted = Vec::new();
         let result = execute_delete_many(targets, |item| {
-            attempted.push(item.path.clone());
-            if item.path == "/ext/b" {
+            attempted.push(item.path.to_string());
+            if item.path.as_str() == "/ext/b" {
                 Err(FlipperError::Session("permission denied".into()))
             } else {
                 Ok(())
@@ -849,8 +826,8 @@ mod tests {
         let targets = vec![target("/ext/a"), target("/ext/b"), target("/ext/c")];
         let mut attempted = Vec::new();
         let result = execute_delete_many(targets, |item| {
-            attempted.push(item.path.clone());
-            if item.path == "/ext/b" {
+            attempted.push(item.path.to_string());
+            if item.path.as_str() == "/ext/b" {
                 Err(FlipperError::Io(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "device disconnected",
@@ -869,5 +846,56 @@ mod tests {
             .stopped_reason
             .as_deref()
             .is_some_and(|reason| reason.contains("device disconnected")));
+    }
+
+    #[test]
+    fn same_target_temp_allocations_do_not_collide_or_delete_each_other() {
+        let dir = test_dir("temp-collision");
+        let target = dir.join("capture.sub");
+        let first = OwnedTempFile::allocate(&target, 41).unwrap();
+        let first_path = first.path().to_path_buf();
+        let second = OwnedTempFile::allocate(&target, 41).unwrap();
+        let second_path = second.path().to_path_buf();
+
+        assert_ne!(first_path, second_path);
+        assert_eq!(first_path.parent(), target.parent());
+        assert_eq!(second_path.parent(), target.parent());
+        assert!(first_path.exists());
+        assert!(second_path.exists());
+
+        drop(first);
+        assert!(!first_path.exists());
+        assert!(
+            second_path.exists(),
+            "one owner must not remove another's temp"
+        );
+        drop(second);
+        assert!(!second_path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn temp_owner_cleans_failure_but_preserves_committed_target() {
+        let dir = test_dir("temp-ownership");
+        let target = dir.join("download.bin");
+
+        let abandoned_path = {
+            let mut abandoned = OwnedTempFile::allocate(&target, 51).unwrap();
+            abandoned.write_all(b"partial").unwrap();
+            abandoned.path().to_path_buf()
+        };
+        assert!(!abandoned_path.exists());
+        assert!(!target.exists());
+
+        write_atomic(&target, b"complete", 52).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"complete");
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+            .count();
+        assert_eq!(leftovers, 0);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

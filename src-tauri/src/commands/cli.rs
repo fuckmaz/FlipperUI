@@ -1,111 +1,92 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, State};
+use tokio::sync::broadcast;
 
+use crate::commands::client::{connection_handle, map_actor_error};
 use crate::error::{FlipperError, Result};
-use crate::flipper::transport::TransportKind;
-use crate::flipper::{cli, client::FlipperClient, gui};
-use crate::state::{AppState, ConnectionMode};
+use crate::flipper::connection_actor::{CliOutputEvent, ConnectionState};
+use crate::state::{AppState, CliOutputGate};
 
-const SCREEN_READER_QUIESCE: Duration = Duration::from_millis(150);
-const CLI_INTERRUPT: &[u8] = &[0x03];
+const CLI_DISCONNECTED: &str = "\r\n[serial error — device disconnected]\r\n";
 
-/// Enter CLI mode: stop the RPC session and start a reader thread that
-/// emits `"cli-output"` events for every chunk of text the Flipper sends.
+fn cli_lag_warning(skipped: u64) -> String {
+    format!("\r\n[CLI output skipped {skipped} chunks — decoder reset]\r\n")
+}
+
+fn emit_cli_disconnect_once(
+    app: &AppHandle,
+    gate: &Arc<Mutex<CliOutputGate>>,
+    generation: u64,
+) -> bool {
+    let mut gate = gate.lock().unwrap();
+    if !gate.claim_disconnect(generation) {
+        return false;
+    }
+    // Generation validation, both emits, and matching-state cleanup are one
+    // synchronous critical section. Reconnect cannot slip between them.
+    let _ = app.emit("cli-output", CLI_DISCONNECTED);
+    true
+}
+
+fn emit_cli_text_if_current(
+    app: &AppHandle,
+    gate: &Arc<Mutex<CliOutputGate>>,
+    generation: u64,
+    text: &str,
+) -> bool {
+    let gate = gate.lock().unwrap();
+    if !gate.is_current(generation) {
+        return false;
+    }
+    let _ = app.emit("cli-output", text);
+    true
+}
+
+/// Enter actor-owned CLI mode after acknowledged legacy screen quiescence.
 #[tauri::command]
 pub async fn cli_start(state: State<'_, AppState>, app: AppHandle) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-    let screen_stream_active = Arc::clone(&state.screen_stream_active);
-    let input_event_tx = Arc::clone(&state.input_event_tx);
-    let cli_reader_active = Arc::clone(&state.cli_reader_active);
+    let lifecycle = Arc::clone(&state.connection_lifecycle);
+    let _lifecycle = lifecycle.lock().await;
 
-    tauri::async_runtime::spawn_blocking(move || -> Result<()> {
-        // Claim the transition before touching the stream. Screen cleanup and
-        // CLI mount happen concurrently in React; marking CLI here prevents a
-        // late screen_stream_stop/start or telemetry RPC from writing protobuf
-        // bytes while the serial port is changing protocols.
-        {
-            let mut mode = mode_mutex.lock().unwrap();
-            if *mode == ConnectionMode::Cli {
-                return Ok(());
-            }
-            *mode = ConnectionMode::Cli;
+    let handle = connection_handle(&state.connection_owner)?;
+    if handle.state() == ConnectionState::Cli {
+        return Ok(());
+    }
+    if handle.state() != ConnectionState::Rpc {
+        return Err(FlipperError::Session(format!(
+            "CLI operation is not allowed while connection is {}",
+            handle.state()
+        )));
+    }
+
+    let generation = state.cli_output_gate.lock().unwrap().begin_session();
+    let output = handle.subscribe_cli_output();
+    tauri::async_runtime::spawn(forward_cli_output(
+        output,
+        app.clone(),
+        Arc::clone(&state.cli_output_gate),
+        generation,
+    ));
+
+    if let Err(error) = handle.enter_cli().await {
+        if handle.state() == ConnectionState::Rpc {
+            state.cli_output_gate.lock().unwrap().invalidate();
+        } else if handle.state() == ConnectionState::Disconnected {
+            emit_cli_disconnect_once(&app, &state.cli_output_gate, generation);
         }
+        return Err(map_actor_error(error));
+    }
 
-        let transition_result = (|| -> Result<()> {
-            // Always quiesce the reader and send the stop-stream RPC ourselves.
-            // The component cleanup may already have cleared the active flag,
-            // but it now observes ConnectionMode::Cli and deliberately leaves
-            // protocol cleanup to this transition owner.
-            let was_streaming = screen_stream_active.swap(false, Ordering::SeqCst);
-            *input_event_tx.lock().unwrap() = None;
-            if was_streaming {
-                tracing::info!("CLI: stopping active screen stream before entering CLI");
-            }
-            std::thread::sleep(SCREEN_READER_QUIESCE);
-
-            let mut guard = client_mutex.lock().unwrap();
-            let client = guard.as_mut().ok_or(FlipperError::NotConnected)?;
-            if client.kind() == TransportKind::Ble {
-                return Err(FlipperError::BleUnsupported);
-            }
-            client
-                .transport
-                .set_timeout(crate::flipper::SERIAL_TIMEOUT_NORMAL)?;
-            // Safe even when no stream was active: firmware answers with a
-            // non-streaming terminal response, which this helper drains.
-            gui::stop_screen_stream(client)?;
-            cli::enter_cli_mode(client)
-        })();
-
-        if let Err(error) = transition_result {
-            let mut mode = mode_mutex.lock().unwrap();
-            *mode = ConnectionMode::Rpc;
-            return Err(error);
-        }
-
-        // Activate the reader thread
-        cli_reader_active.store(true, Ordering::Relaxed);
-
-        let active = Arc::clone(&cli_reader_active);
-        let client_mutex = Arc::clone(&client_mutex);
-        std::thread::spawn(move || {
-            cli_reader_loop(active, client_mutex, app);
-        });
-
-        Ok(())
-    })
-    .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
+    Ok(())
 }
 
 /// Send a text command to the Flipper CLI.
 /// The command is written as raw bytes followed by `\r`.
 #[tauri::command]
 pub async fn cli_send(input: String, state: State<'_, AppState>) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || -> Result<()> {
-        {
-            let mode = mode_mutex.lock().unwrap();
-            if *mode != ConnectionMode::Cli {
-                return Err(FlipperError::Session("Not in CLI mode".into()));
-            }
-        }
-
-        let mut guard = client_mutex.lock().unwrap();
-        let client = guard.as_mut().ok_or(FlipperError::NotConnected)?;
-        let cmd = format!("{}\r", input);
-        client.transport.write_all(cmd.as_bytes())?;
-        client.transport.flush()?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
+    let handle = connection_handle(&state.connection_owner)?;
+    handle.cli_send(&input).await.map_err(map_actor_error)
 }
 
 /// Interrupt the command currently running in the Flipper CLI.
@@ -114,125 +95,147 @@ pub async fn cli_send(input: String, state: State<'_, AppState>) -> Result<()> {
 /// carriage return used for submitted text commands.
 #[tauri::command]
 pub async fn cli_interrupt(state: State<'_, AppState>) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || -> Result<()> {
-        {
-            let mode = mode_mutex.lock().unwrap();
-            if *mode != ConnectionMode::Cli {
-                return Err(FlipperError::Session("Not in CLI mode".into()));
-            }
-        }
-
-        let mut guard = client_mutex.lock().unwrap();
-        let client = guard.as_mut().ok_or(FlipperError::NotConnected)?;
-        client.transport.write_all(CLI_INTERRUPT)?;
-        client.transport.flush()?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
+    let handle = connection_handle(&state.connection_owner)?;
+    handle.cli_interrupt().await.map_err(map_actor_error)
 }
 
-/// Leave CLI mode: stop the reader thread and re-enter RPC mode.
-/// Kept async because exit_cli_mode involves serial I/O that can take a few seconds.
+/// Leave actor-owned CLI mode, verify RPC recovery, and reclaim the client.
+/// Kept async because the acknowledged handoff can take a few seconds.
 #[tauri::command]
-pub async fn cli_stop(state: State<'_, AppState>) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-    let cli_reader_active = Arc::clone(&state.cli_reader_active);
+pub async fn cli_stop(state: State<'_, AppState>, app: AppHandle) -> Result<()> {
+    let lifecycle = Arc::clone(&state.connection_lifecycle);
+    let _lifecycle = lifecycle.lock().await;
+    let generation = state.cli_output_gate.lock().unwrap().current_generation();
+    let Ok(handle) = connection_handle(&state.connection_owner) else {
+        state.cli_output_gate.lock().unwrap().invalidate();
+        return Ok(());
+    };
 
-    tauri::async_runtime::spawn_blocking(move || -> Result<()> {
-        // Signal the reader thread to stop
-        cli_reader_active.store(false, Ordering::SeqCst);
+    if handle.state() == ConnectionState::Rpc {
+        state.cli_output_gate.lock().unwrap().invalidate();
+        return Ok(());
+    }
 
-        // Check if we're actually in CLI mode
-        {
-            let mode = mode_mutex.lock().unwrap();
-            if *mode != ConnectionMode::Cli {
-                return Ok(());
-            }
-        }
-
-        // Re-enter RPC mode
-        let exit_result = {
-            let mut guard = client_mutex.lock().unwrap();
-            let client = match guard.as_mut() {
-                Some(c) => c,
-                None => {
-                    let mut mode = mode_mutex.lock().unwrap();
-                    *mode = ConnectionMode::Rpc;
-                    return Ok(());
-                }
-            };
-
-            match cli::exit_cli_mode(client) {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    tracing::error!("CLI: exit_cli_mode failed: {}, tearing down connection", e);
-                    *guard = None;
-                    Err(e)
-                }
-            }
-        };
-
-        // Always reset mode to Rpc
-        {
-            let mut mode = mode_mutex.lock().unwrap();
-            *mode = ConnectionMode::Rpc;
-        }
-
-        exit_result
-    })
-    .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
+    if let Err(error) = handle.exit_cli().await {
+        tracing::error!(error = %error, "CLI actor exit failed; dropping uncertain connection");
+        let _ = handle.shutdown().await;
+        // The forwarder may win this claim on Closed; either way the gate
+        // permits one terminal marker and one global disconnect only.
+        emit_cli_disconnect_once(&app, &state.cli_output_gate, generation);
+        return Err(map_actor_error(error));
+    }
+    state.cli_output_gate.lock().unwrap().invalidate();
+    Ok(())
 }
 
-/// Background loop that reads from the serial port and emits text as events.
-fn cli_reader_loop(
-    active: Arc<AtomicBool>,
-    client_mutex: Arc<Mutex<Option<FlipperClient>>>,
+async fn forward_cli_output(
+    mut output: broadcast::Receiver<CliOutputEvent>,
     app: AppHandle,
+    gate: Arc<Mutex<CliOutputGate>>,
+    expected_generation: u64,
 ) {
-    let mut buf = [0u8; 1024];
-    let mut decoder = CliOutputDecoder::default();
+    let mut forwarder = CliOutputForwarder::default();
 
     loop {
-        if !active.load(Ordering::Relaxed) {
-            break;
-        }
-
-        let result = {
-            let mut guard = client_mutex.lock().unwrap();
-            if let Some(ref mut client) = *guard {
-                match client.transport.read(&mut buf) {
-                    Ok(n) if n > 0 => Some(Ok(n)),
-                    Ok(_) => None,
-                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => None,
-                    Err(e) => Some(Err(e)),
+        match output.recv().await {
+            Ok(event) => {
+                let action = forwarder.event(event);
+                if let Some(text) = action.text {
+                    if !emit_cli_text_if_current(&app, &gate, expected_generation, &text) {
+                        break;
+                    }
                 }
-            } else {
-                break;
-            }
-        };
-
-        match result {
-            Some(Ok(n)) => {
-                let text = decoder.push(&buf[..n]);
-                if !text.is_empty() {
-                    let _ = app.emit("cli-output", &text);
+                if action.end {
+                    debug_assert_eq!(
+                        classify_cli_terminal(true, true, false),
+                        CliForwardTerminal::NormalEnd
+                    );
+                    break;
                 }
             }
-            Some(Err(_)) => {
-                let _ = app.emit("cli-output", "\r\n[serial error — device disconnected]\r\n");
-                active.store(false, Ordering::Relaxed);
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                forwarder.reset_decoder();
+                let warning = cli_lag_warning(skipped);
+                if !emit_cli_text_if_current(&app, &gate, expected_generation, &warning) {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                let current = gate.lock().unwrap().is_current(expected_generation);
+                if classify_cli_terminal(current, false, true)
+                    == CliForwardTerminal::UnexpectedClosed
+                {
+                    emit_cli_disconnect_once(&app, &gate, expected_generation);
+                }
                 break;
             }
-            None => {}
         }
+    }
+}
 
-        std::thread::sleep(Duration::from_millis(10));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliForwardTerminal {
+    Stale,
+    NormalEnd,
+    UnexpectedClosed,
+}
+
+fn classify_cli_terminal(
+    generation_current: bool,
+    normal_session_end: bool,
+    output_closed: bool,
+) -> CliForwardTerminal {
+    if !generation_current {
+        CliForwardTerminal::Stale
+    } else if normal_session_end || !output_closed {
+        CliForwardTerminal::NormalEnd
+    } else {
+        CliForwardTerminal::UnexpectedClosed
+    }
+}
+
+#[derive(Default)]
+struct CliOutputForwarder {
+    active_session: Option<u64>,
+    decoder: CliOutputDecoder,
+}
+
+struct CliForwardAction {
+    text: Option<String>,
+    end: bool,
+}
+
+impl CliOutputForwarder {
+    fn event(&mut self, event: CliOutputEvent) -> CliForwardAction {
+        match event {
+            CliOutputEvent::SessionStarted { session_id } => {
+                self.active_session = Some(session_id);
+                self.reset_decoder();
+                CliForwardAction {
+                    text: None,
+                    end: false,
+                }
+            }
+            CliOutputEvent::Data { session_id, bytes } => {
+                if self.active_session.is_none() {
+                    // Recovery after an explicitly reported Lagged boundary is
+                    // safe because every data chunk carries its actor session.
+                    self.active_session = Some(session_id);
+                }
+                let text = (self.active_session == Some(session_id))
+                    .then(|| self.decoder.push(&bytes))
+                    .filter(|text| !text.is_empty());
+                CliForwardAction { text, end: false }
+            }
+            CliOutputEvent::SessionEnded { session_id } => CliForwardAction {
+                text: None,
+                end: self.active_session.is_none() || self.active_session == Some(session_id),
+            },
+        }
+    }
+
+    fn reset_decoder(&mut self) {
+        self.decoder = CliOutputDecoder::default();
     }
 }
 
@@ -395,7 +398,71 @@ impl CliOutputDecoder {
 
 #[cfg(test)]
 mod tests {
-    use super::CliOutputDecoder;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::thread;
+
+    use super::{
+        classify_cli_terminal, cli_lag_warning, map_actor_error, CliForwardTerminal,
+        CliOutputDecoder, CliOutputForwarder,
+    };
+    use crate::error::FlipperError;
+    use crate::flipper::connection_actor::{CliOutputEvent, ConnectionActorError, ConnectionState};
+    use crate::state::CliOutputGate;
+
+    #[test]
+    fn terminal_classifier_distinguishes_stale_normal_and_unexpected_close() {
+        assert_eq!(
+            classify_cli_terminal(false, false, true),
+            CliForwardTerminal::Stale
+        );
+        assert_eq!(
+            classify_cli_terminal(true, true, false),
+            CliForwardTerminal::NormalEnd
+        );
+        assert_eq!(
+            classify_cli_terminal(true, false, true),
+            CliForwardTerminal::UnexpectedClosed
+        );
+    }
+
+    #[test]
+    fn output_check_and_emit_gate_serializes_reconnect_invalidation() {
+        let gate = Arc::new(Mutex::new(CliOutputGate::default()));
+        let generation = gate.lock().unwrap().begin_session();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+
+        let output_gate = Arc::clone(&gate);
+        let output = Arc::clone(&emitted);
+        let worker = thread::spawn(move || {
+            let guard = output_gate.lock().unwrap();
+            assert!(guard.is_current(generation));
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            output.lock().unwrap().push(generation);
+        });
+
+        locked_rx.recv().unwrap();
+        assert!(gate.try_lock().is_err());
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        gate.lock().unwrap().invalidate();
+        assert_eq!(*emitted.lock().unwrap(), vec![generation]);
+        assert!(!gate.lock().unwrap().is_current(generation));
+    }
+
+    #[test]
+    fn disconnect_claim_is_exactly_once_per_current_generation() {
+        let mut gate = CliOutputGate::default();
+        let first = gate.begin_session();
+        assert!(gate.claim_disconnect(first));
+        assert!(!gate.claim_disconnect(first));
+        let second = gate.begin_session();
+        assert!(!gate.claim_disconnect(first));
+        assert!(gate.claim_disconnect(second));
+        assert!(!gate.claim_disconnect(second));
+    }
 
     #[test]
     fn decoder_preserves_utf8_split_across_serial_reads() {
@@ -421,5 +488,101 @@ mod tests {
 
         assert_eq!(decoder.push(b"one\r"), "one");
         assert_eq!(decoder.push(b"two\x08\x07\r\nthree"), "\ntwo\nthree");
+    }
+
+    #[test]
+    fn output_forwarder_resets_decoder_and_rejects_stale_session_bytes() {
+        let mut forwarder = CliOutputForwarder::default();
+        assert!(
+            !forwarder
+                .event(CliOutputEvent::SessionStarted { session_id: 7 })
+                .end
+        );
+        assert!(forwarder
+            .event(CliOutputEvent::Data {
+                session_id: 7,
+                bytes: b"partial \xe2\x94".to_vec(),
+            })
+            .text
+            .is_some_and(|text| text == "partial "));
+
+        forwarder.event(CliOutputEvent::SessionStarted { session_id: 8 });
+        assert!(forwarder
+            .event(CliOutputEvent::Data {
+                session_id: 7,
+                bytes: b"stale".to_vec(),
+            })
+            .text
+            .is_none());
+        assert!(forwarder
+            .event(CliOutputEvent::Data {
+                session_id: 8,
+                bytes: b"fresh".to_vec(),
+            })
+            .text
+            .is_some_and(|text| text == "fresh"));
+        assert!(
+            !forwarder
+                .event(CliOutputEvent::SessionEnded { session_id: 7 })
+                .end
+        );
+        assert!(
+            forwarder
+                .event(CliOutputEvent::SessionEnded { session_id: 8 })
+                .end
+        );
+    }
+
+    #[test]
+    fn lag_reset_makes_loss_visible_and_prevents_split_utf8_corruption() {
+        let mut forwarder = CliOutputForwarder::default();
+        forwarder.event(CliOutputEvent::SessionStarted { session_id: 1 });
+        let partial = forwarder.event(CliOutputEvent::Data {
+            session_id: 1,
+            bytes: b"\xe2\x94".to_vec(),
+        });
+        assert!(partial.text.is_none());
+
+        forwarder.reset_decoder();
+        assert_eq!(
+            cli_lag_warning(12),
+            "\r\n[CLI output skipped 12 chunks — decoder reset]\r\n"
+        );
+        assert!(forwarder
+            .event(CliOutputEvent::Data {
+                session_id: 1,
+                bytes: b"\x80safe".to_vec(),
+            })
+            .text
+            .is_some_and(|text| text == "�safe"));
+    }
+
+    #[test]
+    fn actor_errors_preserve_stable_public_connection_meanings() {
+        assert!(matches!(
+            map_actor_error(ConnectionActorError::CliRequiresSerial),
+            FlipperError::BleUnsupported
+        ));
+        assert!(matches!(
+            map_actor_error(ConnectionActorError::Closed),
+            FlipperError::NotConnected
+        ));
+        let locked = map_actor_error(ConnectionActorError::ModeRejected {
+            current: ConnectionState::Rpc,
+        });
+        assert!(matches!(
+            &locked,
+            FlipperError::ConnectionLocked { current } if current == "RPC"
+        ));
+        let public = locked.command_error();
+        assert_eq!(public.code, "operation_locked");
+        assert!(public.retryable);
+        assert_eq!(
+            public
+                .details
+                .as_ref()
+                .and_then(|details| details.get("currentMode")),
+            Some(&"RPC".to_owned())
+        );
     }
 }

@@ -2,11 +2,10 @@
  * Frontend bindings for the firmware-flash tool.
  *
  * The backend owns the modular firmware-source registry and the whole flash
- * pipeline; this module is just typed `invoke` wrappers plus the progress-event
- * helper the modal subscribes to.
+ * pipeline; this module is just typed `invoke` wrappers plus its scoped
+ * progress channel.
  */
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { Channel, invoke } from "@tauri-apps/api/core";
 
 export interface FirmwareProvider {
   id: string;
@@ -66,6 +65,7 @@ export type FlashStage =
 export type FlashLevel = "info" | "ok" | "warn" | "error";
 
 export interface FlashProgress {
+  operationId: number;
   stage: FlashStage;
   /** Empty == pure progress tick (advance the bar, don't log a line). */
   message: string;
@@ -76,6 +76,7 @@ export interface FlashProgress {
 export type FirmwareCancelStatus =
   | "cancelled"
   | "too_late"
+  | "stale_operation"
   | "no_active_operation";
 
 export interface FirmwareCancelResponse {
@@ -101,14 +102,37 @@ export const firmwareFetchDirectory = (
 export const firmwareFlash = (
   source: FlashSource,
   options: FlashOptions,
-): Promise<void> => invoke<void>("firmware_flash", { source, options });
+  onProgress: (progress: FlashProgress) => void,
+): Promise<void> => {
+  let operationId: number | null = null;
+  const channel = new Channel<FlashProgress>((progress) => {
+    operationId = progress.operationId;
+    activeFirmwareOperationId = progress.operationId;
+    onProgress(progress);
+  });
+  return invoke<void>("firmware_flash", {
+    source,
+    options,
+    onProgress: channel,
+  }).finally(() => {
+    if (
+      operationId !== null &&
+      activeFirmwareOperationId === operationId
+    ) {
+      activeFirmwareOperationId = null;
+    }
+  });
+};
+
+let activeFirmwareOperationId: number | null = null;
 
 /** Cancel the active firmware operation without affecting file transfers. */
 export const cancelFirmwareFlash = (): Promise<FirmwareCancelResponse> =>
-  invoke<FirmwareCancelResponse>("cancel_firmware_flash");
-
-/** Subscribe to flash-progress events. Returns the unlisten fn. */
-export const onFlashProgress = (
-  cb: (p: FlashProgress) => void,
-): Promise<UnlistenFn> =>
-  listen<FlashProgress>("firmware-flash-progress", (e) => cb(e.payload));
+  activeFirmwareOperationId === null
+    ? Promise.resolve({
+        status: "no_active_operation",
+        message: "No matching firmware flash is active",
+      })
+    : invoke<FirmwareCancelResponse>("cancel_firmware_flash", {
+        operationId: activeFirmwareOperationId,
+      });

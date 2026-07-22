@@ -16,6 +16,23 @@ export interface DeviceInfo {
   hardware_uid: string | null;
   firmware_version: string | null;
   firmware_build_date: string | null;
+  capabilities: DeviceCapabilities;
+}
+
+export type CapabilityState = "supported" | "unsupported" | "unknown";
+
+export interface Capability {
+  state: CapabilityState;
+  reason?: string;
+}
+
+export interface DeviceCapabilities {
+  rpc: Capability;
+  storage: Capability;
+  screen_stream: Capability;
+  cli: Capability;
+  firmware_update: Capability;
+  gpio: Capability;
 }
 
 /** Matches commands/storage.rs FileEntry */

@@ -13,15 +13,18 @@
  */
 import { LazyStore } from "@tauri-apps/plugin-store";
 import type { SubGhzEntry } from "../types/subghz";
+import {
+  applySubghzCacheMutation,
+  migrateSubghzFavorites,
+  reconcileSubghzFavorites,
+  type SubGhzCacheMutation,
+  type SubGhzCacheSnapshot,
+} from "./subghzFavorites";
 
 const STORE_FILE = "subghz-cache.json";
 
-interface DeviceCache {
-  scannedAt: number;
-  entries: SubGhzEntry[];
-  /** Starred entry paths. Survives re-scans. */
-  favorites?: string[];
-}
+/** Device cache with stable signal identities (legacy path values migrate on load). */
+export type DeviceCache = SubGhzCacheSnapshot;
 
 type CacheMap = Record<string, DeviceCache>;
 
@@ -31,6 +34,7 @@ const store = new LazyStore(STORE_FILE, {
 });
 
 const ROOT_KEY = "cache";
+let mutationQueue: Promise<unknown> = Promise.resolve();
 
 async function readAll(): Promise<CacheMap> {
   return (await store.get<CacheMap>(ROOT_KEY)) ?? {};
@@ -39,22 +43,38 @@ async function readAll(): Promise<CacheMap> {
 /** Load the cached scan for a device UID, or `null` if never scanned. */
 export async function loadSubghzCache(uid: string): Promise<DeviceCache | null> {
   const all = await readAll();
-  return all[uid] ?? null;
+  const current = all[uid];
+  if (!current) return null;
+  const favorites = migrateSubghzFavorites(current.favorites, current.entries);
+  if (!sameStrings(favorites, current.favorites ?? [])) {
+    const migrated = { ...current, favorites };
+    await mutate(async (latest) => {
+      latest[uid] = migrated;
+      return migrated;
+    });
+    return migrated;
+  }
+  return { ...current, favorites };
 }
 
 /** Persist scan results for the given device UID. Preserves favorites. */
 export async function saveSubghzCache(
   uid: string,
   entries: SubGhzEntry[],
-): Promise<void> {
-  const all = await readAll();
-  const prev = all[uid];
-  all[uid] = {
-    scannedAt: Date.now(),
-    entries,
-    favorites: prev?.favorites ?? [],
-  };
-  await store.set(ROOT_KEY, all);
+): Promise<DeviceCache> {
+  return mutate(async (all) => {
+    const prev = all[uid];
+    const next: DeviceCache = {
+      scannedAt: Date.now(),
+      entries,
+      favorites: reconcileSubghzFavorites(
+        migrateSubghzFavorites(prev?.favorites, prev?.entries ?? entries),
+        entries,
+      ),
+    };
+    all[uid] = next;
+    return next;
+  });
 }
 
 /** Persist favorites for the given device UID. Preserves entries/scannedAt. */
@@ -62,23 +82,63 @@ export async function saveSubghzFavorites(
   uid: string,
   favorites: string[],
 ): Promise<void> {
-  const all = await readAll();
-  const prev = all[uid];
-  all[uid] = {
-    scannedAt: prev?.scannedAt ?? 0,
-    entries: prev?.entries ?? [],
-    favorites,
-  };
-  await store.set(ROOT_KEY, all);
+  await mutate(async (all) => {
+    const prev = all[uid];
+    const entries = prev?.entries ?? [];
+    all[uid] = {
+      scannedAt: prev?.scannedAt ?? 0,
+      entries,
+      favorites: reconcileSubghzFavorites(favorites, entries),
+    };
+  });
+}
+
+export function mutateSubghzCacheEntry(
+  uid: string,
+  change: SubGhzCacheMutation,
+): Promise<DeviceCache> {
+  return mutate(async (all) => {
+    const current: DeviceCache = all[uid] ?? {
+      scannedAt: 0,
+      entries: [],
+      favorites: [],
+    };
+    const next = applySubghzCacheMutation(
+      { ...current, favorites: current.favorites ?? [] },
+      change,
+    );
+    all[uid] = next;
+    return next;
+  });
 }
 
 /** Drop the cache entry for a specific UID (or all if omitted). */
 export async function clearSubghzCache(uid?: string): Promise<void> {
   if (!uid) {
-    await store.set(ROOT_KEY, {});
+    await mutate(async (all) => {
+      for (const key of Object.keys(all)) delete all[key];
+    });
     return;
   }
-  const all = await readAll();
-  delete all[uid];
-  await store.set(ROOT_KEY, all);
+  await mutate(async (all) => {
+    delete all[uid];
+  });
+}
+
+function mutate<T>(operation: (all: CacheMap) => Promise<T> | T): Promise<T> {
+  const next = mutationQueue.then(async () => {
+    const all = await readAll();
+    const result = await operation(all);
+    await store.set(ROOT_KEY, all);
+    return result;
+  });
+  mutationQueue = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  return next;
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }

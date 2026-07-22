@@ -46,7 +46,7 @@ impl RxShared {
 
     /// Called by the notification task when the peer disconnects.
     pub fn close(&self, reason: impl Into<String>) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.lock_recover();
         if !g.closed {
             g.closed = true;
             g.close_reason = Some(reason.into());
@@ -56,9 +56,19 @@ impl RxShared {
 
     /// Called by the notification task when fresh bytes arrive.
     pub fn push(&self, bytes: &[u8]) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.lock_recover();
         g.bytes.extend(bytes);
         self.cv.notify_all();
+    }
+
+    fn lock_recover(&self) -> std::sync::MutexGuard<'_, RxBuffer> {
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("BLE receive buffer lock was poisoned; recovering owned state");
+                poisoned.into_inner()
+            }
+        }
     }
 }
 
@@ -106,7 +116,7 @@ impl BleTransport {
     fn wait_free(&self, needed: u32) -> io::Result<()> {
         let deadline = Instant::now() + FLOW_WAIT_TIMEOUT;
         loop {
-            if self.rx.inner.lock().unwrap().closed {
+            if self.rx.lock_recover().closed {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "BLE transport closed during write",
@@ -149,13 +159,17 @@ impl Transport for BleTransport {
         // total available is enough for the whole buffer.
         if from_rx > 0 {
             let deadline = Instant::now() + self.timeout;
-            let mut g = self.rx.inner.lock().unwrap();
+            let mut g = self.rx.lock_recover();
             while g.bytes.len() < from_rx && !g.closed {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return Err(io::Error::new(io::ErrorKind::TimedOut, "BLE read timeout"));
                 }
-                let (ng, wr) = self.rx.cv.wait_timeout(g, remaining).unwrap();
+                let (ng, wr) = self
+                    .rx
+                    .cv
+                    .wait_timeout(g, remaining)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 g = ng;
                 if wr.timed_out() && g.bytes.len() < from_rx && !g.closed {
                     return Err(io::Error::new(io::ErrorKind::TimedOut, "BLE read timeout"));
@@ -195,13 +209,17 @@ impl Transport for BleTransport {
             return Ok(take);
         }
         let deadline = Instant::now() + self.timeout;
-        let mut g = self.rx.inner.lock().unwrap();
+        let mut g = self.rx.lock_recover();
         while g.bytes.is_empty() && !g.closed {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "BLE read timeout"));
             }
-            let (ng, wr) = self.rx.cv.wait_timeout(g, remaining).unwrap();
+            let (ng, wr) = self
+                .rx
+                .cv
+                .wait_timeout(g, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             g = ng;
             if wr.timed_out() && g.bytes.is_empty() && !g.closed {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "BLE read timeout"));

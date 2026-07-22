@@ -40,6 +40,7 @@ use crate::flipper::storage;
 /// device type.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NfcEntry {
+    #[serde(deserialize_with = "crate::commands::path::deserialize_device_path_string")]
     pub path: String,
     pub name: String,
     pub device_type: Option<String>,

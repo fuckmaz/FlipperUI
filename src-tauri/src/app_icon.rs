@@ -74,6 +74,86 @@ const VARIANTS: &[Variant] = &[
 /// `tray_icon_for` so the tray stays in sync with the app icon choice.
 static CURRENT_VARIANT: Mutex<&'static str> = Mutex::new(VARIANT_DEFAULT);
 
+/// Pure ownership bookkeeping for Windows taskbar icons.
+///
+/// `WM_SETICON` borrows the supplied `HICON`; it does not take ownership.  We
+/// therefore keep exactly one app-created handle per HWND until that window is
+/// assigned a replacement icon or is destroyed.  Labels are only a teardown
+/// index: ownership itself is keyed by the native window handle.
+#[cfg(any(test, target_os = "windows"))]
+#[derive(Debug, Default)]
+struct OwnedIconRegistry {
+    by_hwnd: std::collections::HashMap<usize, OwnedWindowIcon>,
+    hwnd_by_label: std::collections::HashMap<String, usize>,
+}
+
+#[cfg(any(test, target_os = "windows"))]
+#[derive(Debug)]
+struct OwnedWindowIcon {
+    label: String,
+    handle: usize,
+}
+
+#[cfg(any(test, target_os = "windows"))]
+impl OwnedIconRegistry {
+    /// Register a freshly installed handle and return app-owned handles that
+    /// are no longer referenced by a window and may now be destroyed.
+    fn replace(&mut self, label: &str, hwnd: usize, handle: usize) -> Vec<usize> {
+        let mut retired = Vec::with_capacity(2);
+
+        // A Tauri label can be reused after a native window is recreated.  In
+        // that case the prior HWND (and its independently-created icon) is no
+        // longer represented by the label and must be retired.
+        if let Some(previous_hwnd) = self.hwnd_by_label.get(label).copied() {
+            if previous_hwnd != hwnd {
+                self.hwnd_by_label.remove(label);
+                if let Some(previous) = self.by_hwnd.remove(&previous_hwnd) {
+                    retired.push(previous.handle);
+                }
+            }
+        }
+
+        // Replacing an icon on the same HWND makes the previous borrowed
+        // handle safe to destroy after WM_SETICON has returned.
+        if let Some(previous) = self.by_hwnd.remove(&hwnd) {
+            if self.hwnd_by_label.get(&previous.label) == Some(&hwnd) {
+                self.hwnd_by_label.remove(&previous.label);
+            }
+            retired.push(previous.handle);
+        }
+
+        self.hwnd_by_label.insert(label.to_string(), hwnd);
+        self.by_hwnd.insert(
+            hwnd,
+            OwnedWindowIcon {
+                label: label.to_string(),
+                handle,
+            },
+        );
+
+        retired.sort_unstable();
+        retired.dedup();
+        retired
+    }
+
+    fn remove_label(&mut self, label: &str) -> Option<usize> {
+        let hwnd = self.hwnd_by_label.remove(label)?;
+        self.by_hwnd.remove(&hwnd).map(|entry| entry.handle)
+    }
+
+    fn drain(&mut self) -> Vec<usize> {
+        self.hwnd_by_label.clear();
+        self.by_hwnd
+            .drain()
+            .map(|(_, entry)| entry.handle)
+            .collect()
+    }
+}
+
+#[cfg(target_os = "windows")]
+static OWNED_TASKBAR_ICONS: once_cell::sync::Lazy<Mutex<OwnedIconRegistry>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(OwnedIconRegistry::default()));
+
 /// Return the list of variants for the chooser UI. Cheap to call: the PNG
 /// bytes are static and base64 encoding runs O(n) over ~20 KB.
 pub fn variants() -> Vec<VariantDescriptor> {
@@ -262,13 +342,7 @@ fn apply_dock_icon(_png: &[u8]) -> Result<(), FlipperError> {
 #[cfg(target_os = "windows")]
 fn apply_taskbar_icon(app: &AppHandle, png: &[u8]) -> Result<(), FlipperError> {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::Graphics::Gdi::{
-        CreateBitmap, CreateDIBSection, DeleteObject, GetDC, ReleaseDC, BITMAPINFO,
-        BITMAPINFOHEADER, DIB_RGB_COLORS, RGBQUAD,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CreateIconIndirect, SendMessageW, ICONINFO, ICON_BIG, WM_SETICON,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, ICON_BIG, WM_SETICON};
 
     let image = Image::from_bytes(png)
         .map_err(|e| FlipperError::Internal(format!("decode app-icon PNG: {e}")))?;
@@ -283,9 +357,48 @@ fn apply_taskbar_icon(app: &AppHandle, png: &[u8]) -> Result<(), FlipperError> {
         pixel.swap(0, 2);
     }
 
+    for window in app.webview_windows().values() {
+        if let Ok(hwnd) = window.hwnd() {
+            // Each HWND gets its own HICON. Sharing one handle between windows
+            // makes it impossible to know when it is safe to destroy.
+            let hicon = create_taskbar_hicon(width, height, &bgra)?;
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_SETICON,
+                    Some(WPARAM(ICON_BIG as usize)),
+                    Some(LPARAM(hicon.0 as isize)),
+                );
+            }
+
+            let retired = {
+                let mut registry = OWNED_TASKBAR_ICONS.lock().unwrap_or_else(|poisoned| {
+                    tracing::warn!("taskbar-icon registry mutex was poisoned; recovering");
+                    poisoned.into_inner()
+                });
+                registry.replace(window.label(), hwnd.0 as usize, hicon.0 as usize)
+            };
+            destroy_owned_taskbar_icons(retired);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn create_taskbar_hicon(
+    width: i32,
+    height: i32,
+    bgra: &[u8],
+) -> Result<windows::Win32::UI::WindowsAndMessaging::HICON, FlipperError> {
+    use windows::Win32::Graphics::Gdi::{
+        CreateBitmap, CreateDIBSection, DeleteObject, GetDC, ReleaseDC, BITMAPINFO,
+        BITMAPINFOHEADER, DIB_RGB_COLORS, RGBQUAD,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, ICONINFO};
+
     unsafe {
         let hdc = GetDC(None);
-
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -307,7 +420,6 @@ fn apply_taskbar_icon(app: &AppHandle, png: &[u8]) -> Result<(), FlipperError> {
         std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits as *mut u8, bgra.len());
 
         let mask_bmp = CreateBitmap(width, height, 1, 1, None);
-
         let icon_info = ICONINFO {
             fIcon: true.into(),
             xHotspot: 0,
@@ -326,24 +438,58 @@ fn apply_taskbar_icon(app: &AppHandle, png: &[u8]) -> Result<(), FlipperError> {
         let _ = DeleteObject(color_bmp.into());
         let _ = DeleteObject(mask_bmp.into());
         ReleaseDC(None, hdc);
-
-        for window in app.webview_windows().values() {
-            if let Ok(hwnd) = window.hwnd() {
-                SendMessageW(
-                    hwnd,
-                    WM_SETICON,
-                    Some(WPARAM(ICON_BIG as usize)),
-                    Some(LPARAM(hicon.0 as isize)),
-                );
-            }
-        }
-
-        // Intentionally leak the HICON — the OS references the handle for
-        // the taskbar tile, and icon changes are rare user actions.
-
-        Ok(())
+        Ok(hicon)
     }
 }
+
+#[cfg(target_os = "windows")]
+fn destroy_owned_taskbar_icons(handles: Vec<usize>) {
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
+
+    for handle in handles {
+        if handle == 0 {
+            continue;
+        }
+        if let Err(error) = unsafe { DestroyIcon(HICON(handle as *mut std::ffi::c_void)) } {
+            tracing::warn!("DestroyIcon failed for app-owned taskbar icon: {error}");
+        }
+    }
+}
+
+/// Release the icon owned for a destroyed Tauri window. The label is only
+/// used to find the HWND-keyed registry entry; the destroyed handle itself no
+/// longer needs to be queried from Tauri.
+#[cfg(target_os = "windows")]
+pub fn release_taskbar_icon_for_window(label: &str) {
+    let retired = {
+        let mut registry = OWNED_TASKBAR_ICONS.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("taskbar-icon registry mutex was poisoned; recovering");
+            poisoned.into_inner()
+        });
+        registry.remove_label(label).into_iter().collect()
+    };
+    destroy_owned_taskbar_icons(retired);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn release_taskbar_icon_for_window(_label: &str) {}
+
+/// Final safety net for process exit paths that do not deliver a Destroyed
+/// event for every window.
+#[cfg(target_os = "windows")]
+pub fn release_all_taskbar_icons() {
+    let retired = {
+        let mut registry = OWNED_TASKBAR_ICONS.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("taskbar-icon registry mutex was poisoned; recovering");
+            poisoned.into_inner()
+        });
+        registry.drain()
+    };
+    destroy_owned_taskbar_icons(retired);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn release_all_taskbar_icons() {}
 
 /// Write a Finder custom icon onto the running `.app` bundle so the Dock
 /// launcher and Finder show the chosen icon *before* our process starts and
@@ -445,6 +591,55 @@ pub fn load_saved_variant(app: &AppHandle) -> &'static str {
             VARIANT_DEFAULT
         }
         None => VARIANT_DEFAULT,
+    }
+}
+
+#[cfg(test)]
+mod owned_icon_registry_tests {
+    use super::OwnedIconRegistry;
+
+    #[test]
+    fn replacing_an_icon_retires_only_the_prior_handle_for_that_hwnd() {
+        let mut registry = OwnedIconRegistry::default();
+
+        assert!(registry.replace("main", 10, 100).is_empty());
+        assert!(registry.replace("settings", 20, 200).is_empty());
+        assert_eq!(registry.replace("main", 10, 101), vec![100]);
+        assert_eq!(registry.remove_label("settings"), Some(200));
+        assert_eq!(registry.remove_label("main"), Some(101));
+    }
+
+    #[test]
+    fn recreating_a_label_retires_the_icon_owned_by_the_old_hwnd() {
+        let mut registry = OwnedIconRegistry::default();
+
+        assert!(registry.replace("main", 10, 100).is_empty());
+        assert_eq!(registry.replace("main", 11, 101), vec![100]);
+        assert_eq!(registry.remove_label("main"), Some(101));
+        assert!(registry.drain().is_empty());
+    }
+
+    #[test]
+    fn reusing_an_hwnd_removes_the_stale_label_mapping() {
+        let mut registry = OwnedIconRegistry::default();
+
+        assert!(registry.replace("old", 10, 100).is_empty());
+        assert_eq!(registry.replace("new", 10, 101), vec![100]);
+        assert_eq!(registry.remove_label("old"), None);
+        assert_eq!(registry.remove_label("new"), Some(101));
+    }
+
+    #[test]
+    fn draining_returns_each_per_window_handle_once() {
+        let mut registry = OwnedIconRegistry::default();
+        registry.replace("main", 10, 100);
+        registry.replace("settings", 20, 200);
+
+        let mut drained = registry.drain();
+        drained.sort_unstable();
+        assert_eq!(drained, vec![100, 200]);
+        assert!(registry.drain().is_empty());
+        assert_eq!(registry.remove_label("main"), None);
     }
 }
 

@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { Tv, AlertTriangle } from "lucide-react";
 import { useFlipperStore } from "../../store/useFlipperStore";
 import { infraredCancelScan, infraredScan } from "../../lib/tauri";
@@ -7,9 +6,9 @@ import { loadSettings, subscribeSettings, updateSettings } from "../../lib/setti
 import { useLibraryPreScan } from "../../hooks/useLibraryPreScan";
 import { loadInfraredCache, saveInfraredCache } from "../../lib/infraredCache";
 import { notify } from "../../lib/notify";
+import { commandErrorMessage, isCommandCancelled } from "../../lib/commandError";
 import { LibraryToolbar } from "./LibraryToolbar";
 import { LibraryTable } from "./LibraryTable";
-import type { IrScanProgress } from "../../types/infrared";
 
 const IR_ROOT = "/ext/infrared";
 
@@ -45,21 +44,6 @@ export function InfraredLibrary() {
     }
   }, [injection, clearInjection]);
 
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-    listen<IrScanProgress>("infrared-scan-progress", (e) =>
-      setProgress(e.payload),
-    ).then((u) => {
-      if (cancelled) u();
-      else unlisten = u;
-    });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [setProgress]);
-
   // Rehydrate from disk on every deviceUid change; clears stale entries from
   // a previous device and makes the library available as soon as a device is
   // known. Disk is the source of truth — scans always save before returning.
@@ -90,7 +74,7 @@ export function InfraredLibrary() {
         },
       );
       if (effective === null) return;
-      const list = await infraredScan(IR_ROOT, effective, entries);
+      const list = await infraredScan(IR_ROOT, effective, entries, setProgress);
       setEntries(list);
       if (deviceUid) {
         await saveInfraredCache(deviceUid, list).catch(() => {});
@@ -98,9 +82,8 @@ export function InfraredLibrary() {
       }
       void notify("libraryScan", "Infrared scan complete", `${list.length} entries indexed.`);
     } catch (e) {
-      const msg = (e as Error).message || String(e);
-      if (!msg.toLowerCase().includes("cancelled")) {
-        setError(`Scan failed: ${msg}`);
+      if (!isCommandCancelled(e)) {
+        setError(`Scan failed: ${commandErrorMessage(e, "infrared_scan")}`);
       }
     } finally {
       setScanning(false);

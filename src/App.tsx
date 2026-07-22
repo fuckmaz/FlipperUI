@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { connect, connectBleDevice } from "./lib/tauri";
+import { connectBleDevice } from "./lib/tauri";
 import { DevicePanel } from "./components/DevicePanel/DevicePanel";
 import { FileBrowser } from "./components/FileBrowser/FileBrowser";
 import { CliPanel } from "./components/CliPanel/CliPanel";
@@ -19,7 +19,8 @@ import { Dashboard } from "./components/Dashboard/Dashboard";
 import { CommandPalette } from "./components/CommandPalette/CommandPalette";
 import { SideRail } from "./components/Nav/SideRail";
 import { useFlipperStore, type ActiveView } from "./store/useFlipperStore";
-import { loadSettings, subscribeSettings } from "./lib/settings";
+import { loadSettings, subscribeSettings, updateSettings } from "./lib/settings";
+import { connectPreferredAvailableUsbDevice } from "./lib/usbConnection";
 import { applyAccentColor } from "./lib/theme";
 import { syncClockOnConnectIfEnabled } from "./lib/clockSync";
 import { notify } from "./lib/notify";
@@ -27,15 +28,29 @@ import { usePreloadLibraries } from "./hooks/usePreloadLibraries";
 import flipperOutlineUrl from "./assets/flipper-outline.svg";
 import { ErrorBanner } from "./components/ui/ErrorBanner";
 import { AppUpdateNotice } from "./components/AppUpdate/AppUpdateNotice";
+import { resolveFeatureAvailability } from "./lib/capabilities";
+import type { DeviceCapabilities } from "./types/flipper";
+import { deviceTelemetry } from "./lib/deviceTelemetry";
 
 export default function App() {
   const activeView = useFlipperStore((s) => s.activeView);
   const setActiveView = useFlipperStore((s) => s.setActiveView);
   const isConnected = useFlipperStore((s) => s.isConnected);
+  const deviceInfo = useFlipperStore((s) => s.deviceInfo);
   const setConnected = useFlipperStore((s) => s.setConnected);
   const setError = useFlipperStore((s) => s.setError);
 
   usePreloadLibraries();
+
+  // One app-lifetime owner drives all low-frequency device telemetry. Views
+  // subscribe to the same snapshot instead of starting competing RPC timers.
+  useEffect(() => {
+    deviceTelemetry.setConnection(
+      isConnected && deviceInfo
+        ? `${deviceInfo.hardware_uid ?? "unknown"}:${deviceInfo.port}`
+        : null,
+    );
+  }, [deviceInfo, isConnected]);
 
   // Close the splash window and show the main window once React has mounted.
   // We can't gate on rAF here because the main window starts with
@@ -133,9 +148,10 @@ export default function App() {
           reconnectAttemptsRef.current = 0;
           return;
         }
-        if (transport === "usb" && lastPort) {
-          const info = await connect(lastPort);
+        if (transport === "usb") {
+          const info = await connectPreferredAvailableUsbDevice(lastPort);
           const clockError = await maybeSyncClockAfterConnect();
+          void updateSettings({ connection: { lastPort: info.port } }).catch(() => {});
           setConnected(info);
           setError(clockError);
           reconnectAttemptsRef.current = 0;
@@ -234,6 +250,7 @@ function ActivePane({
   const nfcCount = useFlipperStore((s) => s.nfcEntries.length);
   const rfidCount = useFlipperStore((s) => s.rfidEntries.length);
   const badusbCount = useFlipperStore((s) => s.badusbEntries.length);
+  const deviceInfo = useFlipperStore((s) => s.deviceInfo);
 
   if (activeView === "settings") {
     return <SettingsPane />;
@@ -265,6 +282,28 @@ function ActivePane({
     return <DisconnectedEmptyState />;
   }
 
+  const capabilityByView: Partial<Record<ActiveView, keyof DeviceCapabilities>> = {
+    files: "storage",
+    apps: "storage",
+    gpio: "gpio",
+    cli: "cli",
+    screen: "screen_stream",
+  };
+  const requiredCapability = capabilityByView[activeView];
+  if (requiredCapability) {
+    const availability = resolveFeatureAvailability(
+      deviceInfo?.capabilities[requiredCapability],
+    );
+    if (!availability.available) {
+      return (
+        <FeatureUnavailable
+          feature={activeView === "cli" ? "Terminal" : activeView}
+          reason={availability.reason}
+        />
+      );
+    }
+  }
+
   if (activeView === "apps") return <AppLibrary />;
   if (activeView === "gpio") return <GpioView />;
   if (activeView === "info") return <DeviceInfoView />;
@@ -274,6 +313,15 @@ function ActivePane({
   return (
     <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
       <FileBrowser />
+    </div>
+  );
+}
+
+function FeatureUnavailable({ feature, reason }: { feature: string; reason: string }) {
+  return (
+    <div className="flex-1 flex flex-col items-center justify-center gap-2 px-6 text-center">
+      <p className="text-sm font-medium text-primary capitalize">{feature} unavailable</p>
+      <p className="max-w-md text-xs text-muted">{reason}</p>
     </div>
   );
 }

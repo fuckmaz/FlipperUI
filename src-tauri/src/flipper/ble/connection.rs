@@ -1,13 +1,16 @@
 //! BLE connection handshake — resolve peripheral, subscribe to characteristics,
 //! spin up the notification dispatch task, and hand a [`FlipperClient`] back.
 
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use btleplug::api::{Central, CentralEvent, CharPropFlags, Characteristic, Peripheral as _};
+use btleplug::api::{
+    Central, CentralEvent, CharPropFlags, Characteristic, Peripheral as _, ValueNotification,
+};
 use btleplug::platform::Peripheral;
-use futures::StreamExt;
-use tauri::{AppHandle, Emitter, Manager};
+use futures::{Stream, StreamExt};
+use tauri::{AppHandle, Manager};
 use tokio::sync::oneshot;
 
 use crate::error::{FlipperError, Result};
@@ -15,6 +18,8 @@ use crate::flipper::ble::runtime::{shared_adapter, BLE_RT};
 use crate::flipper::ble::transport::{BleTransport, RxShared};
 use crate::flipper::ble::{OVERFLOW_CHAR, RPC_STATE_CHAR, RX_CHAR, TX_CHAR};
 use crate::flipper::client::FlipperClient;
+use crate::flipper::connection_actor::ConnectionHandle;
+use crate::state::{classify_ble_task, BleTaskDisposition};
 
 fn map_btle_err(err: impl std::fmt::Display) -> FlipperError {
     let s = err.to_string();
@@ -117,14 +122,17 @@ fn find_char(peripheral: &Peripheral, uuid: uuid::Uuid) -> Result<Characteristic
 /// The returned `cancel_tx` is how the disconnect command asks the notification
 /// task to exit cleanly. Send `()` on it; the task will drop its peripheral
 /// reference and set the RX buffer to `closed`.
-pub fn connect_ble(id: String, app: AppHandle) -> Result<(FlipperClient, oneshot::Sender<()>)> {
-    BLE_RT.block_on(async move { connect_ble_async(id, app).await })
+pub struct BleConnection {
+    pub client: FlipperClient,
+    pub cancel: oneshot::Sender<()>,
+    pub completed: oneshot::Receiver<()>,
 }
 
-async fn connect_ble_async(
-    id: String,
-    app: AppHandle,
-) -> Result<(FlipperClient, oneshot::Sender<()>)> {
+pub fn connect_ble(id: String, app: AppHandle, session_id: u64) -> Result<BleConnection> {
+    BLE_RT.block_on(async move { connect_ble_async(id, app, session_id).await })
+}
+
+async fn connect_ble_async(id: String, app: AppHandle, session_id: u64) -> Result<BleConnection> {
     let adapter = shared_adapter().await?;
     tracing::info!("BLE connect: resolving peripheral id={}", id);
 
@@ -204,7 +212,19 @@ async fn connect_ble_async(
     };
     let overflow = Arc::new(AtomicU32::new(initial_free));
 
+    // Acquire the notifications stream before publishing a usable transport.
+    // A task that discovers notifications() is unavailable after the client is
+    // visible creates a short-lived ghost connection and loses early bytes.
+    let stream = match peripheral.notifications().await {
+        Ok(stream) => stream,
+        Err(error) => {
+            let _ = peripheral.disconnect().await;
+            return Err(map_btle_err(error));
+        }
+    };
+
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+    let (completed_tx, completed_rx) = oneshot::channel::<()>();
 
     // Spawn notification dispatch task on the BLE runtime. It owns the
     // peripheral's notifications stream and lives until either the stream
@@ -215,13 +235,16 @@ async fn connect_ble_async(
     let app_for_task = app.clone();
 
     BLE_RT.spawn(async move {
-        run_notification_task(
-            peripheral_for_task,
-            rx_for_task,
-            overflow_for_task,
+        run_notification_task(NotificationTask {
+            peripheral: peripheral_for_task,
+            rx: rx_for_task,
+            overflow: overflow_for_task,
+            stream,
             cancel_rx,
-            app_for_task,
-        )
+            completed_tx,
+            app: app_for_task,
+            session_id,
+        })
         .await;
     });
 
@@ -233,25 +256,35 @@ async fn connect_ble_async(
 
     let transport: Box<dyn crate::flipper::transport::Transport> =
         Box::new(BleTransport::new(peripheral, rx_char, rx, overflow));
-    Ok((FlipperClient::new(transport), cancel_tx))
+    Ok(BleConnection {
+        client: FlipperClient::new(transport),
+        cancel: cancel_tx,
+        completed: completed_rx,
+    })
 }
 
-async fn run_notification_task(
+struct NotificationTask {
     peripheral: Peripheral,
     rx: Arc<RxShared>,
     overflow: Arc<AtomicU32>,
-    mut cancel_rx: oneshot::Receiver<()>,
+    stream: Pin<Box<dyn Stream<Item = ValueNotification> + Send>>,
+    cancel_rx: oneshot::Receiver<()>,
+    completed_tx: oneshot::Sender<()>,
     app: AppHandle,
-) {
-    let mut stream = match peripheral.notifications().await {
-        Ok(s) => s,
-        Err(e) => {
-            rx.close(format!("notifications() failed: {e}"));
-            let _ = app.emit("flipper-disconnected", format!("BLE: {e}"));
-            return;
-        }
-    };
+    session_id: u64,
+}
 
+async fn run_notification_task(task: NotificationTask) {
+    let NotificationTask {
+        peripheral,
+        rx,
+        overflow,
+        mut stream,
+        mut cancel_rx,
+        completed_tx,
+        app,
+        session_id,
+    } = task;
     let reason: String = loop {
         tokio::select! {
             _ = &mut cancel_rx => {
@@ -281,23 +314,134 @@ async fn run_notification_task(
     // Best-effort teardown — ignore errors, the peer may already be gone.
     let _ = peripheral.disconnect().await;
     rx.close(reason.clone());
+    // Replacement/disconnect waits only for resources owned by this task.
+    // Signal that first; global cleanup is separately serialized and guarded
+    // by session identity below.
+    let _ = completed_tx.send(());
 
-    // Drop the client out of AppState so subsequent commands surface
-    // `NotConnected` immediately instead of trying to read from a closed
-    // RxBuffer (which would otherwise look like a transport error and trigger
-    // teardown logic in random call sites). Doing it here means the disconnect
-    // is a single, well-defined event regardless of who notices first.
-    if let Some(state) = app.try_state::<crate::state::AppState>() {
-        if let Ok(mut guard) = state.client.lock() {
-            *guard = None;
+    // Signal the single connection owner so subsequent commands surface
+    // `NotConnected` immediately. The notification task never clears the
+    // published connection slot or emits the global disconnect itself; the
+    // actor monitor owns both actions and therefore makes fatal publication
+    // exact-once.
+    let Some(state) = app.try_state::<crate::state::AppState>() else {
+        return;
+    };
+    let lifecycle = Arc::clone(&state.connection_lifecycle);
+    let _lifecycle = lifecycle.lock().await;
+    if classify_ble_task(
+        state.ble_session_generation.load(Ordering::Acquire),
+        session_id,
+    ) == BleTaskDisposition::Stale
+    {
+        return;
+    }
+
+    // Recheck at the mutation boundary. The lifecycle lock makes this stable;
+    // the second check documents and enforces the task-identity contract.
+    if classify_ble_task(
+        state.ble_session_generation.load(Ordering::Acquire),
+        session_id,
+    ) == BleTaskDisposition::Stale
+    {
+        return;
+    }
+    {
+        let mut completion = state
+            .ble_session_completion
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if completion
+            .as_ref()
+            .is_some_and(|owned| owned.id == session_id)
+        {
+            completion.take();
         }
-        state
-            .screen_stream_active
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(mut tx_slot) = state.input_event_tx.lock() {
-            *tx_slot = None;
+    }
+    state
+        .ble_cancel_tx
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    let owner = current_ble_owner_to_signal(&state.connection_owner);
+    if let Some(owner) = owner {
+        let _ = owner.shutdown().await;
+    }
+}
+
+fn current_ble_owner_to_signal(
+    owner: &std::sync::Mutex<Option<ConnectionHandle>>,
+) -> Option<ConnectionHandle> {
+    owner
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|owner| owner.transport_kind() == crate::flipper::transport::TransportKind::Ble)
+        .cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use super::current_ble_owner_to_signal;
+    use crate::flipper::client::FlipperClient;
+    use crate::flipper::connection_actor::ConnectionHandle;
+    use crate::flipper::transport::{Transport, TransportKind};
+
+    struct IdleBleTransport;
+
+    impl Transport for IdleBleTransport {
+        fn read_exact(&mut self, _buffer: &mut [u8]) -> io::Result<()> {
+            Err(io::ErrorKind::TimedOut.into())
+        }
+
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::TimedOut.into())
+        }
+
+        fn write_all(&mut self, _bytes: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn set_timeout(&mut self, _duration: Duration) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn unread(&mut self, _bytes: &[u8]) {}
+
+        fn kind(&self) -> TransportKind {
+            TransportKind::Ble
         }
     }
 
-    let _ = app.emit("flipper-disconnected", reason);
+    #[tokio::test]
+    async fn notification_teardown_signals_actor_without_clearing_owner_slot() {
+        let handle = ConnectionHandle::spawn(FlipperClient::new(Box::new(IdleBleTransport)))
+            .expect("BLE actor should start");
+        let owner = Mutex::new(Some(handle.clone()));
+
+        let signal = current_ble_owner_to_signal(&owner).expect("BLE actor should be signalled");
+        assert!(owner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|published| published.same_connection(&handle)));
+
+        signal
+            .shutdown()
+            .await
+            .expect("actor shutdown should finish");
+        assert!(owner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|published| published.same_connection(&handle)));
+    }
 }

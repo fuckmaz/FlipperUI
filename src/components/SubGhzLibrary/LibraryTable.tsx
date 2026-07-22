@@ -19,7 +19,12 @@ import { useExportDrag } from "../../hooks/useExportDrag";
 import { relativeDir, parentDir, nextDuplicateName } from "../../lib/path";
 import { formatMtime } from "../../lib/format";
 import { storageRead, storageRename, storageWrite, storageDelete } from "../../lib/tauri";
-import { saveSubghzCache } from "../../lib/subghzCache";
+import { mutateSubghzCacheEntry, saveSubghzCache } from "../../lib/subghzCache";
+import {
+  applySubghzCacheMutation,
+  subghzFavoriteIdentity,
+  type SubGhzCacheMutation,
+} from "../../lib/subghzFavorites";
 import { ContextMenu, type MenuItem } from "../ui/ContextMenu";
 import type { SubGhzEntry } from "../../types/subghz";
 
@@ -32,7 +37,7 @@ type SortDir = "asc" | "desc";
 interface Props {
   entries: SubGhzEntry[];
   favorites: Set<string>;
-  onToggleFavorite: (path: string) => void;
+  onToggleFavorite: (entry: SubGhzEntry) => void;
 }
 
 export function LibraryTable({ entries, favorites, onToggleFavorite }: Props) {
@@ -107,8 +112,7 @@ export function LibraryTable({ entries, favorites, onToggleFavorite }: Props) {
               >
                 <Row
                   entry={entry}
-                  allEntries={entries}
-                  starred={favorites.has(entry.path)}
+                  starred={favorites.has(subghzFavoriteIdentity(entry))}
                   onToggleFavorite={onToggleFavorite}
                   onContextMenu={openMenu}
                 />
@@ -181,19 +185,18 @@ function HeaderCell({
 
 function Row({
   entry,
-  allEntries,
   starred,
   onToggleFavorite,
   onContextMenu,
 }: {
   entry: SubGhzEntry;
-  allEntries: SubGhzEntry[];
   starred: boolean;
-  onToggleFavorite: (path: string) => void;
+  onToggleFavorite: (entry: SubGhzEntry) => void;
   onContextMenu: (e: React.MouseEvent, items: MenuItem[]) => void;
 }) {
   const setError = useFlipperStore((s) => s.setSubghzError);
   const setEntries = useFlipperStore((s) => s.setSubghzEntries);
+  const setFavorites = useFlipperStore((s) => s.setSubghzFavorites);
   const deviceUid = useFlipperStore((s) => s.deviceInfo?.hardware_uid ?? null);
 
   const [renaming, setRenaming] = useState(false);
@@ -204,8 +207,33 @@ function Row({
   const handleDragStart = useExportDrag(entry.path, entry.name);
 
   const persistList = async (next: SubGhzEntry[]) => {
+    if (deviceUid) {
+      const cache = await saveSubghzCache(deviceUid, next);
+      setEntries(cache.entries);
+      setFavorites(cache.favorites);
+      return;
+    }
     setEntries(next);
-    if (deviceUid) await saveSubghzCache(deviceUid, next).catch(() => {});
+  };
+
+  const persistMutation = async (change: SubGhzCacheMutation) => {
+    if (deviceUid) {
+      const cache = await mutateSubghzCacheEntry(deviceUid, change);
+      setEntries(cache.entries);
+      setFavorites(cache.favorites);
+      return;
+    }
+    const state = useFlipperStore.getState();
+    const next = applySubghzCacheMutation(
+      {
+        scannedAt: 0,
+        entries: state.subghzEntries,
+        favorites: state.subghzFavorites,
+      },
+      change,
+    );
+    setEntries(next.entries);
+    setFavorites(next.favorites);
   };
 
   const onMaps = async () => {
@@ -240,17 +268,19 @@ function Row({
     }
     const parent = parentDir(entry.path);
     const newPath = `${parent}/${newName}`;
-    if (allEntries.some((e) => e.path === newPath)) {
+    const currentEntries = useFlipperStore.getState().subghzEntries;
+    if (currentEntries.some((e) => e.path === newPath)) {
       setError(`A file named "${newName}" already exists here.`);
       return;
     }
     setBusy("rename");
     try {
       await storageRename(entry.path, newPath);
-      const next = allEntries.map((e) =>
-        e.path === entry.path ? { ...e, path: newPath, name: newName } : e,
-      );
-      await persistList(next);
+      await persistMutation({
+        kind: "rename",
+        oldPath: entry.path,
+        entry: { ...entry, path: newPath, name: newName },
+      });
       setRenaming(false);
     } catch (e) {
       setError(`Rename failed: ${(e as Error).message || String(e)}`);
@@ -263,8 +293,9 @@ function Row({
     setBusy("dup");
     try {
       const parent = parentDir(entry.path);
+      const currentEntries = useFlipperStore.getState().subghzEntries;
       const existingNames = new Set(
-        allEntries.filter((e) => parentDir(e.path) === parent).map((e) => e.name),
+        currentEntries.filter((e) => parentDir(e.path) === parent).map((e) => e.name),
       );
       const newName = nextDuplicateName(entry.name, existingNames);
       const newPath = `${parent}/${newName}`;
@@ -278,7 +309,7 @@ function Row({
         name: newName,
         mtime: null,
       };
-      await persistList([...allEntries, duplicate]);
+      await persistList([...currentEntries, duplicate]);
     } catch (e) {
       setError(`Duplicate failed: ${(e as Error).message || String(e)}`);
     } finally {
@@ -297,7 +328,7 @@ function Row({
     setBusy("delete");
     try {
       await storageDelete(entry.path, false);
-      await persistList(allEntries.filter((e) => e.path !== entry.path));
+      await persistMutation({ kind: "delete", path: entry.path });
     } catch (e) {
       setError(`Delete failed: ${(e as Error).message || String(e)}`);
     } finally {
@@ -311,7 +342,7 @@ function Row({
       {
         label: starred ? "Unstar" : "Star",
         icon: <Star size={12} className={starred ? "fill-accent text-accent" : ""} />,
-        onClick: () => onToggleFavorite(entry.path),
+        onClick: () => onToggleFavorite(entry),
       },
     ];
     if (entry.coordinates) {
@@ -408,7 +439,7 @@ function Row({
       </span>
       <div className="flex items-center justify-end gap-0.5">
         <button
-          onClick={() => onToggleFavorite(entry.path)}
+          onClick={() => onToggleFavorite(entry)}
           title={starred ? "Unstar" : "Star"}
           aria-label={starred ? "Unstar" : "Star"}
           aria-pressed={starred}

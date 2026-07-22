@@ -2,9 +2,11 @@ use std::sync::Arc;
 
 use tauri::State;
 
-use crate::error::{FlipperError, Result};
+use crate::commands::client::with_connection;
+use crate::commands::path::DevicePath;
+use crate::error::Result;
 use crate::flipper::app;
-use crate::state::{AppState, ConnectionMode};
+use crate::state::AppState;
 
 /// Launch a Flipper application by name with optional CLI-style args.
 /// App-level RPC errors (busy, locked, unknown app) surface as
@@ -12,43 +14,16 @@ use crate::state::{AppState, ConnectionMode};
 /// are recoverable from the user's side.
 #[tauri::command]
 pub async fn app_start(name: String, args: String, state: State<'_, AppState>) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
-        {
-            let mode = mode_mutex.lock().unwrap();
-            if *mode == ConnectionMode::Cli {
-                return Err(FlipperError::CliModeActive);
-            }
-        }
-        let mut guard = client_mutex.lock().unwrap();
-        let client = guard.as_mut().ok_or(FlipperError::NotConnected)?;
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         app::app_start(client, &name, &args)
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 /// Exit the currently running Flipper application.
 #[tauri::command]
 pub async fn app_exit(state: State<'_, AppState>) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
-        {
-            let mode = mode_mutex.lock().unwrap();
-            if *mode == ConnectionMode::Cli {
-                return Err(FlipperError::CliModeActive);
-            }
-        }
-        let mut guard = client_mutex.lock().unwrap();
-        let client = guard.as_mut().ok_or(FlipperError::NotConnected)?;
-        app::app_exit(client)
-    })
-    .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
+    with_connection(Arc::clone(&state.connection_owner), app::app_exit).await
 }
 
 /// Begin Sub-GHz replay of a .sub file via RPC.
@@ -59,20 +34,8 @@ pub async fn app_exit(state: State<'_, AppState>) -> Result<()> {
 /// to simulate an OK press, which kicks off the actual radio TX. The app
 /// keeps transmitting until [`subghz_tx_stop`] releases the button and exits.
 #[tauri::command]
-pub async fn subghz_tx_start(path: String, state: State<'_, AppState>) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
-        {
-            let mode = mode_mutex.lock().unwrap();
-            if *mode == ConnectionMode::Cli {
-                return Err(FlipperError::CliModeActive);
-            }
-        }
-        let mut guard = client_mutex.lock().unwrap();
-        let client = guard.as_mut().ok_or(FlipperError::NotConnected)?;
-
+pub async fn subghz_tx_start(path: DevicePath, state: State<'_, AppState>) -> Result<()> {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         // Launch the Sub-GHz app with the .sub path as args — the app
         // preloads the key and jumps to the Transmitter scene, which is
         // where RPC button events are actually wired up in firmware.
@@ -89,30 +52,16 @@ pub async fn subghz_tx_start(path: String, state: State<'_, AppState>) -> Result
         Ok(())
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 /// Stop an in-progress Sub-GHz replay and exit the app.
 #[tauri::command]
 pub async fn subghz_tx_stop(state: State<'_, AppState>) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
-        {
-            let mode = mode_mutex.lock().unwrap();
-            if *mode == ConnectionMode::Cli {
-                return Err(FlipperError::CliModeActive);
-            }
-        }
-        let mut guard = client_mutex.lock().unwrap();
-        let client = guard.as_mut().ok_or(FlipperError::NotConnected)?;
-
+    with_connection(Arc::clone(&state.connection_owner), |client| {
         // Release first, then exit. Ignore release errors — the button may not
         // be currently held (e.g. user already pressed Back on the device).
         let _ = app::app_button_release(client);
         app::app_exit(client)
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }

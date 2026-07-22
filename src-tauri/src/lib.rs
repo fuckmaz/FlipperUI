@@ -2,6 +2,7 @@ pub mod app_icon;
 pub mod commands;
 pub mod error;
 pub mod flipper;
+pub mod operation;
 pub mod state;
 
 // Include prost-generated protobuf bindings.
@@ -276,6 +277,11 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_notification::init())
         .manage(AppState::new())
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                app_icon::release_taskbar_icon_for_window(window.label());
+            }
+        })
         .setup(|app| {
             // Custom app-menu with a "Settings…" item (Cmd+,). Clicking it
             // emits "open-settings" so the frontend can open the dialog.
@@ -475,6 +481,7 @@ pub fn run() {
             commands::badusb::badusb_cancel_scan,
             commands::badusb::badusb_parse_paths,
             commands::library_prewalk::library_prewalk,
+            commands::library_prewalk::cancel_library_prewalk,
             commands::apps::apps_scan,
             commands::apps::apps_cancel_scan,
             commands::apps::apps_parse_paths,
@@ -497,6 +504,11 @@ pub fn run() {
             commands::gpio::gpio_get_otg,
             commands::gpio::gpio_set_otg,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                app_icon::release_all_taskbar_icons();
+            }
+        });
 }

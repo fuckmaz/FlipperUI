@@ -15,6 +15,8 @@ import {
 } from "lucide-react";
 import { useFlipperStore, type ActiveView } from "../../store/useFlipperStore";
 import { disconnect, reboot } from "../../lib/tauri";
+import { commandErrorMessage } from "../../lib/commandError";
+import { resolveFeatureAvailability } from "../../lib/capabilities";
 
 type CommandKind = "nav" | "action";
 
@@ -43,6 +45,10 @@ export function CommandPalette() {
   const setError = useFlipperStore((s) => s.setError);
   const isConnected = useFlipperStore((s) => s.isConnected);
   const connectionKind = useFlipperStore((s) => s.connectionKind);
+  const deviceInfo = useFlipperStore((s) => s.deviceInfo);
+  const cliConnected = useFlipperStore((s) => s.cliConnected);
+  const transferProgress = useFlipperStore((s) => s.transferProgress);
+  const fileBrowserDeleting = useFlipperStore((s) => s.fileBrowserDeleting);
 
   // Cmd/Ctrl+K toggles open. Esc closes. Open from anywhere — including inside
   // input fields — so the user always has an escape hatch to navigate.
@@ -83,17 +89,44 @@ export function CommandPalette() {
   );
 
   const commands = useMemo<Command[]>(() => {
+    const busyReason = transferProgress !== null
+      ? "A file transfer currently owns device work"
+      : fileBrowserDeleting
+        ? "A file deletion currently owns device work"
+        : false;
+    const lockedReason = cliConnected
+      ? "Terminal mode currently owns the connection"
+      : false;
+    const cliAvailability = resolveFeatureAvailability(deviceInfo?.capabilities.cli, {
+      busy: busyReason,
+    });
+    const rpcAvailability = resolveFeatureAvailability(deviceInfo?.capabilities.rpc, {
+      busy: busyReason,
+      locked: lockedReason,
+    });
+    const screenAvailability = resolveFeatureAvailability(
+      deviceInfo?.capabilities.screen_stream,
+      { busy: busyReason, locked: lockedReason },
+    );
+    const storageAvailability = resolveFeatureAvailability(
+      deviceInfo?.capabilities.storage,
+      { locked: lockedReason },
+    );
+    const firmwareAvailability = resolveFeatureAvailability(
+      deviceInfo?.capabilities.firmware_update,
+      { busy: busyReason, locked: lockedReason },
+    );
     const navItems: Command[] = [
       { id: "nav:dashboard", kind: "nav", label: "Dashboard", Icon: Home, keywords: ["home", "overview"], run: () => navigate("dashboard") },
-      { id: "nav:files", kind: "nav", label: "File Explorer", Icon: FolderTree, keywords: ["browse", "storage", "ext"], disabledReason: !isConnected ? "Connect first" : undefined, run: () => navigate("files") },
-      { id: "nav:apps", kind: "nav", label: "Apps", Icon: Zap, keywords: ["fap", "plugins"], disabledReason: !isConnected ? "Connect first" : undefined, run: () => navigate("apps") },
+      { id: "nav:files", kind: "nav", label: "File Explorer", Icon: FolderTree, keywords: ["browse", "storage", "ext"], disabledReason: !isConnected ? "Connect first" : storageAvailability.available ? undefined : storageAvailability.reason, run: () => navigate("files") },
+      { id: "nav:apps", kind: "nav", label: "Apps", Icon: Zap, keywords: ["fap", "plugins"], disabledReason: !isConnected ? "Connect first" : storageAvailability.available ? undefined : storageAvailability.reason, run: () => navigate("apps") },
       { id: "nav:subghz", kind: "nav", label: "Sub-GHz library", Icon: Zap, keywords: ["radio", "rf", "sub"], run: () => navigate("subghz") },
       { id: "nav:infrared", kind: "nav", label: "Infrared library", Icon: Zap, keywords: ["ir", "remote"], run: () => navigate("infrared") },
       { id: "nav:nfc", kind: "nav", label: "NFC library", Icon: Zap, keywords: ["card", "13.56", "mifare"], run: () => navigate("nfc") },
       { id: "nav:rfid", kind: "nav", label: "RFID library", Icon: Zap, keywords: ["lf", "lfrfid", "125khz", "em4100", "prox"], run: () => navigate("rfid") },
       { id: "nav:badusb", kind: "nav", label: "BadUSB library", Icon: Zap, keywords: ["ducky", "keystrokes"], run: () => navigate("badusb") },
-      { id: "nav:screen", kind: "nav", label: "Live screen", Icon: Monitor, keywords: ["mirror", "stream"], disabledReason: !isConnected ? "Connect first" : undefined, run: () => navigate("screen") },
-      { id: "nav:cli", kind: "nav", label: "Terminal", Icon: Terminal, keywords: ["cli", "shell"], disabledReason: !isConnected ? "Connect first" : connectionKind === "ble" ? "Not available over BLE" : undefined, run: () => navigate("cli") },
+      { id: "nav:screen", kind: "nav", label: "Live screen", Icon: Monitor, keywords: ["mirror", "stream"], disabledReason: !isConnected ? "Connect first" : screenAvailability.available ? undefined : screenAvailability.reason, run: () => navigate("screen") },
+      { id: "nav:cli", kind: "nav", label: "Terminal", Icon: Terminal, keywords: ["cli", "shell"], disabledReason: !isConnected ? "Connect first" : cliAvailability.available ? undefined : cliAvailability.reason, run: () => navigate("cli") },
       { id: "nav:info", kind: "nav", label: "Device info", Icon: Info, keywords: ["firmware", "battery"], disabledReason: !isConnected ? "Connect first" : undefined, run: () => navigate("info") },
       { id: "nav:settings", kind: "nav", label: "Settings", Icon: SettingsIcon, keywords: ["preferences", "config"], run: () => navigate("settings") },
     ];
@@ -112,7 +145,7 @@ export function CommandPalette() {
             await disconnect();
             setConnected(null);
           } catch (e) {
-            setError(`Disconnect failed: ${(e as Error).message || String(e)}`);
+            setError(`Disconnect failed: ${commandErrorMessage(e, "disconnect")}`);
           }
         },
       },
@@ -123,13 +156,13 @@ export function CommandPalette() {
         hint: "Restart the Flipper into normal mode",
         Icon: Power,
         keywords: ["restart"],
-        disabledReason: !isConnected ? "Connect first" : undefined,
+        disabledReason: !isConnected ? "Connect first" : rpcAvailability.available ? undefined : rpcAvailability.reason,
         run: async () => {
           close();
           try {
             await reboot(0);
           } catch (e) {
-            setError(`Reboot failed: ${(e as Error).message || String(e)}`);
+            setError(`Reboot failed: ${commandErrorMessage(e, "reboot")}`);
           }
         },
       },
@@ -140,20 +173,31 @@ export function CommandPalette() {
         hint: "Bootloader mode for firmware flashing",
         Icon: Power,
         keywords: ["bootloader", "flash", "update"],
-        disabledReason: !isConnected ? "Connect first" : undefined,
+        disabledReason: !isConnected ? "Connect first" : firmwareAvailability.available ? undefined : firmwareAvailability.reason,
         run: async () => {
           close();
           try {
             await reboot(1);
           } catch (e) {
-            setError(`Reboot failed: ${(e as Error).message || String(e)}`);
+            setError(`Reboot failed: ${commandErrorMessage(e, "reboot_dfu")}`);
           }
         },
       },
     ];
 
     return [...navItems, ...actionItems];
-  }, [isConnected, connectionKind, navigate, close, setConnected, setError]);
+  }, [
+    isConnected,
+    connectionKind,
+    deviceInfo,
+    cliConnected,
+    transferProgress,
+    fileBrowserDeleting,
+    navigate,
+    close,
+    setConnected,
+    setError,
+  ]);
 
   const filtered = useMemo(() => fuzzyFilter(commands, query), [commands, query]);
 

@@ -1,317 +1,209 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use base64::Engine;
 use tauri::{AppHandle, Emitter, State};
 
+use crate::commands::client::{connection_handle, map_actor_error};
 use crate::error::{FlipperError, Result};
-use crate::flipper::client::FlipperClient;
+use crate::flipper::connection_actor::ConnectionState;
 use crate::flipper::gui;
-use crate::state::{AppState, ConnectionMode, InputEventTx};
+use crate::pb::main::Content;
+use crate::state::AppState;
 
-/// InputType constants matching the Flipper protobuf enum.
-const PRESS: i32 = 0;
-const RELEASE: i32 = 1;
-const SHORT: i32 = 2;
-const LONG: i32 = 3;
-
-/// Bound per reader-loop iteration. We process exactly one event between
-/// frame reads so a burst of inputs can't open a long write-only window —
-/// on BLE that window was enough to corrupt framing and kill the stream.
-/// The frontend enforces its own short wait-list so dropped events here are
-/// rare; serializing strictly at the boundary keeps reads and writes paced.
-const MAX_INPUTS_PER_ITER: usize = 1;
-
-/// Start the screen stream. Spawns a background thread that reads frames
-/// and emits them as `"screen-frame"` events (base64-encoded RGBA, 128x64).
+/// Start actor-owned screen streaming and forward the actor's coalescing frame
+/// subscription to the frontend. The connection actor remains the only reader
+/// and input writer for the complete lifetime of this mode.
 #[tauri::command]
 pub async fn screen_stream_start(state: State<'_, AppState>, app: AppHandle) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-    let screen_stream_active = Arc::clone(&state.screen_stream_active);
-    let input_event_tx = Arc::clone(&state.input_event_tx);
+    let lifecycle = Arc::clone(&state.connection_lifecycle);
+    let _lifecycle = lifecycle.lock().await;
+    let handle = connection_handle(&state.connection_owner)?;
+    if handle.state() == ConnectionState::ScreenStreaming {
+        return Ok(());
+    }
+    if handle.state() != ConnectionState::Rpc {
+        return Err(FlipperError::Session(format!(
+            "Screen streaming is not allowed while connection is {}",
+            handle.state()
+        )));
+    }
 
-    tauri::async_runtime::spawn_blocking(move || -> Result<()> {
-        {
-            let mode = mode_mutex.lock().unwrap();
-            if *mode == ConnectionMode::Cli {
-                return Err(FlipperError::CliModeActive);
-            }
-        }
+    let frames = handle.subscribe_screen_frames();
+    handle
+        .start_screen_stream()
+        .await
+        .map_err(map_actor_error)?;
 
-        if screen_stream_active.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-
-        // Start the stream and pick a reader timeout for the transport. Serial
-        // uses a short window so the OS-level read releases the client mutex
-        // between frames; BLE uses a longer window because waits release the
-        // RxBuffer condvar (not the client mutex) and BLE bodies need ~100 ms
-        // to fully arrive — a 100 ms timeout would expire mid-frame.
-        {
-            let mut guard = client_mutex.lock().unwrap();
-            let client = guard.as_mut().ok_or(FlipperError::NotConnected)?;
-            gui::start_screen_stream(client)?;
-            let timeout = match client.transport.kind() {
-                crate::flipper::transport::TransportKind::Ble => crate::flipper::BLE_TIMEOUT_SCREEN,
-                crate::flipper::transport::TransportKind::Serial => {
-                    crate::flipper::SERIAL_TIMEOUT_SCREEN
-                }
-            };
-            client.transport.set_timeout(timeout)?;
-        }
-
-        // Create the input-event channel. `send_input_event` enqueues events
-        // here; the reader thread dequeues and writes them between reads, so
-        // the reader never contends on the client mutex with the writer.
-        let (tx, rx) = mpsc::channel::<(i32, i32)>();
-        *input_event_tx.lock().unwrap() = Some(tx);
-
-        screen_stream_active.store(true, Ordering::Relaxed);
-
-        let active = Arc::clone(&screen_stream_active);
-        let client_mutex = Arc::clone(&client_mutex);
-        let mode_mutex = Arc::clone(&mode_mutex);
-        let input_tx_holder = Arc::clone(&input_event_tx);
-
-        std::thread::spawn(move || {
-            screen_reader_loop(active, client_mutex, mode_mutex, input_tx_holder, rx, app);
-        });
-
-        Ok(())
-    })
-    .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
+    let generation = next_screen_generation(&state.screen_stream_generation);
+    tauri::async_runtime::spawn(forward_screen_frames(
+        frames,
+        app,
+        Arc::clone(&state.screen_stream_generation),
+        generation,
+    ));
+    Ok(())
 }
 
-/// Send a button input event to the Flipper.
-/// key: 0=UP 1=DOWN 2=RIGHT 3=LEFT 4=OK 5=BACK
-/// input_type: 0=PRESS 1=RELEASE 2=SHORT 3=LONG 4=REPEAT
-// Tauri v2 defaults argument names to camelCase; `rename_all` keeps
-// the frontend's existing snake_case calling convention.
+/// Forward one event from the frontend's complete input lifecycle unchanged.
+/// The actor validates the key/type and serializes acknowledgement reads with
+/// frame delivery, including LONG/REPEAT and the final RELEASE.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn send_input_event(key: i32, input_type: i32, state: State<'_, AppState>) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-    let screen_stream_active = Arc::clone(&state.screen_stream_active);
-    let input_event_tx = Arc::clone(&state.input_event_tx);
-
-    tauri::async_runtime::spawn_blocking(move || -> Result<()> {
-        {
-            let mode = mode_mutex.lock().unwrap();
-            if *mode == ConnectionMode::Cli {
-                return Err(FlipperError::CliModeActive);
-            }
-        }
-
-        // While the screen stream reader is running, route events through its
-        // channel so writes and reads are serialized on one thread. This
-        // prevents keyboard auto-repeat from starving the reader and
-        // overflowing the serial buffer, which was corrupting frame framing
-        // and killing the stream. Clone the Sender out and drop the lock
-        // before sending so we don't hold the input_event_tx mutex across
-        // the channel send.
-        if screen_stream_active.load(Ordering::Relaxed) {
-            let tx = input_event_tx.lock().unwrap().clone();
-            if let Some(tx) = tx {
-                return tx
-                    .send((key, input_type))
-                    .map_err(|_| FlipperError::Internal("input channel closed".into()));
-            }
-        }
-
-        // Fallback — stream is off, take the client mutex directly.
-        let mut guard = client_mutex.lock().unwrap();
-        let client = guard.as_mut().ok_or(FlipperError::NotConnected)?;
-        write_input(client, key, input_type)
-    })
-    .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
+    let handle = connection_handle(&state.connection_owner)?;
+    handle
+        .send_screen_input(key, input_type)
+        .await
+        .map_err(map_actor_error)
 }
 
-/// Stop the screen stream.
+/// Stop the stream with the actor's acknowledged transition. No fixed sleep,
+/// secondary reader, or transport handoff participates in this operation.
 #[tauri::command]
 pub async fn screen_stream_stop(state: State<'_, AppState>) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-    let screen_stream_active = Arc::clone(&state.screen_stream_active);
-    let input_event_tx = Arc::clone(&state.input_event_tx);
-
-    tauri::async_runtime::spawn_blocking(move || -> Result<()> {
-        if !screen_stream_active.load(Ordering::Relaxed) {
-            return Ok(());
+    let lifecycle = Arc::clone(&state.connection_lifecycle);
+    let _lifecycle = lifecycle.lock().await;
+    next_screen_generation(&state.screen_stream_generation);
+    let handle = match connection_handle(&state.connection_owner) {
+        Ok(handle) => handle,
+        Err(FlipperError::NotConnected) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    match handle.state() {
+        ConnectionState::ScreenStreaming => {
+            handle.stop_screen_stream().await.map_err(map_actor_error)
         }
-
-        screen_stream_active.store(false, Ordering::Relaxed);
-
-        // Drop the sender so any later `send_input_event` takes the fallback
-        // path. The reader thread still holds its receiver; it will exit on
-        // the next iteration when it sees `active == false`.
-        *input_event_tx.lock().unwrap() = None;
-
-        // Wait one full reader iteration so the thread releases the client
-        // mutex before we send the stop command. Now safe because we're on
-        // a spawn_blocking thread, not the Tauri main loop.
-        std::thread::sleep(Duration::from_millis(150));
-
-        // cli_start marks the mode before quiescing the same reader. If that
-        // transition owns cleanup, sending a protobuf stop request here could
-        // land after the port has already switched to text CLI and appear as a
-        // stray one-character command. Let cli_start drain the stream instead.
-        if *mode_mutex.lock().unwrap() == ConnectionMode::Cli {
-            return Ok(());
-        }
-
-        {
-            let mut guard = client_mutex.lock().unwrap();
-            if let Some(ref mut client) = *guard {
-                let _ = client
-                    .transport
-                    .set_timeout(crate::flipper::SERIAL_TIMEOUT_NORMAL);
-                let _ = gui::stop_screen_stream(client);
-            }
-        }
-
-        Ok(())
-    })
-    .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
-}
-
-/// A SHORT or LONG tap expands to PRESS → (SHORT|LONG) → RELEASE — the bracketed
-/// triplet qFlipper sends. Apps that only watch PRESS/RELEASE (games, custom
-/// ViewPorts) need the surrounding press/release, while apps that act on the
-/// SHORT/LONG type get it in between.
-///
-/// LONG is expanded here too. An RPC-injected `InputTypeLong` is delivered to
-/// the focused app directly — the firmware does *not* re-derive long-press from
-/// hold duration the way it does for the physical buttons, so there's no need
-/// to space the events out over ~300 ms. Sending the triplet atomically (one
-/// reader iteration, back-to-back writes) is what makes the long press reliably
-/// register; a standalone LONG spread across the key lifecycle was being
-/// dropped, which is why long-press appeared not to work.
-fn write_input(client: &mut FlipperClient, key: i32, input_type: i32) -> Result<()> {
-    if input_type == SHORT || input_type == LONG {
-        gui::send_input_event(client, key, PRESS)?;
-        gui::send_input_event(client, key, input_type)?;
-        gui::send_input_event(client, key, RELEASE)?;
-        Ok(())
-    } else {
-        gui::send_input_event(client, key, input_type)
+        ConnectionState::Rpc | ConnectionState::Disconnected => Ok(()),
+        current => Err(FlipperError::Session(format!(
+            "Screen stop is not allowed while connection is {current}"
+        ))),
     }
 }
 
-/// Background loop that reads screen frames and emits them, and also handles
-/// queued input events. Running reads and writes on one thread prevents the
-/// cross-thread mutex starvation that used to corrupt frame framing.
-fn screen_reader_loop(
-    active: Arc<AtomicBool>,
-    client_mutex: Arc<Mutex<Option<FlipperClient>>>,
-    mode_mutex: Arc<Mutex<ConnectionMode>>,
-    input_tx_holder: InputEventTx,
-    rx: mpsc::Receiver<(i32, i32)>,
+fn next_screen_generation(generation: &std::sync::atomic::AtomicU64) -> u64 {
+    let next = generation.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    if next == 0 {
+        generation.store(1, Ordering::Release);
+        1
+    } else {
+        next
+    }
+}
+
+async fn forward_screen_frames(
+    mut frames: tokio::sync::watch::Receiver<Option<crate::pb::Main>>,
     app: AppHandle,
+    active_generation: Arc<std::sync::atomic::AtomicU64>,
+    expected_generation: u64,
 ) {
-    use crate::flipper::framing::read_message;
-    use crate::pb::main::Content;
-
-    let mut fatal: Option<String> = None;
-
-    'outer: loop {
-        if !active.load(Ordering::Relaxed) {
+    while frames.changed().await.is_ok() {
+        if active_generation.load(Ordering::Acquire) != expected_generation {
             break;
         }
-
-        // Step 1: drain queued input events (bounded) and write them. Holding
-        // the client mutex only for this batch keeps the window short.
-        let mut pending: Vec<(i32, i32)> = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            pending.push(ev);
-            if pending.len() >= MAX_INPUTS_PER_ITER {
-                break;
-            }
-        }
-        if !pending.is_empty() {
-            let mut guard = client_mutex.lock().unwrap();
-            let Some(client) = guard.as_mut() else {
-                fatal = Some("client was torn down by another command".into());
-                break 'outer;
-            };
-            for (key, input_type) in pending {
-                if let Err(e) = write_input(client, key, input_type) {
-                    fatal = Some(format!("input event write failed: {e}"));
-                    break 'outer;
-                }
-            }
-        }
-
-        // Step 2: read one message. TimedOut is normal (no frame yet); any
-        // other error is fatal and means framing is likely corrupt.
-        let frame = {
-            let mut guard = client_mutex.lock().unwrap();
-            let Some(client) = guard.as_mut() else {
-                // Another path (typically `with_client` after an RPC error)
-                // tore down the client while we were between iterations. Log
-                // it so the disconnect isn't a silent mystery.
-                fatal = Some("client was torn down by another command".into());
-                break 'outer;
-            };
-            match read_message(&mut *client.transport) {
-                Ok(msg) => {
-                    let data = if let Some(Content::GuiScreenFrame(frame)) = msg.content {
-                        Some((frame.data, frame.orientation))
-                    } else {
-                        None
-                    };
-                    Ok(Some(data))
-                }
-                Err(FlipperError::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    Ok(None)
-                }
-                Err(e) => Err(e),
-            }
+        let Some(message) = frames.borrow_and_update().clone() else {
+            continue;
         };
+        let Some(Content::GuiScreenFrame(frame)) = message.content else {
+            continue;
+        };
+        let rgba = gui::xbm_to_rgba(&frame.data, 0x000000, 0xFF8300);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(rgba);
+        let _ = app.emit("screen-frame", encoded);
+    }
+}
 
-        match frame {
-            Ok(Some(Some((data, _orientation)))) => {
-                // Dark segments on an amber backlight: set bit → black,
-                // unset bit → orange.
-                let rgba = gui::xbm_to_rgba(&data, 0x000000, 0xFF8300);
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&rgba);
-                let _ = app.emit("screen-frame", &b64);
-            }
-            Ok(Some(None)) => {
-                // Empty ack (from start-stream or an input event) — not end of
-                // stream; the reader exits only via the `active` flag.
-            }
-            Ok(None) => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(e) => {
-                fatal = Some(format!("screen stream read failed: {e}"));
-                break;
-            }
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use prost::Message;
+
+    use crate::flipper::client::FlipperClient;
+    use crate::flipper::gui;
+    use crate::flipper::transport::{Transport, TransportKind};
+    use crate::pb;
+    use crate::pb::main::Content;
+
+    struct RecordingTransport {
+        writes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Transport for RecordingTransport {
+        fn read_exact(&mut self, _buffer: &mut [u8]) -> io::Result<()> {
+            Err(io::ErrorKind::UnexpectedEof.into())
+        }
+
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+
+        fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.writes.lock().unwrap().extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn set_timeout(&mut self, _duration: Duration) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn unread(&mut self, _bytes: &[u8]) {}
+
+        fn kind(&self) -> TransportKind {
+            TransportKind::Serial
         }
     }
 
-    // Reader is exiting — regardless of why, clear state it owns.
-    active.store(false, Ordering::Relaxed);
-    *input_tx_holder.lock().unwrap() = None;
+    fn decode_writes(mut bytes: &[u8]) -> Vec<pb::Main> {
+        let mut messages = Vec::new();
+        while !bytes.is_empty() {
+            let mut length = 0_usize;
+            let mut shift = 0;
+            let mut prefix_len = 0;
+            loop {
+                let byte = bytes[prefix_len];
+                prefix_len += 1;
+                length |= usize::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            let end = prefix_len + length;
+            messages.push(pb::Main::decode(&bytes[prefix_len..end]).unwrap());
+            bytes = &bytes[end..];
+        }
+        messages
+    }
 
-    if let Some(reason) = fatal {
-        // Framing is probably corrupt, so the serial session is unrecoverable.
-        // Tear down the client and tell the frontend, so the UI reflects the
-        // real state instead of showing "connected" over a dead link.
-        tracing::warn!("screen reader exiting: {reason}");
-        {
-            let mut guard = client_mutex.lock().unwrap();
-            *guard = None;
+    #[test]
+    fn screen_input_forwards_every_button_lifecycle_event_exactly_once() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let mut client = FlipperClient::new(Box::new(RecordingTransport {
+            writes: Arc::clone(&writes),
+        }));
+
+        for key in 0..6 {
+            for input_type in 0..5 {
+                gui::send_input_event(&mut client, key, input_type).unwrap();
+            }
         }
-        {
-            let mut mode = mode_mutex.lock().unwrap();
-            *mode = ConnectionMode::Rpc;
+
+        let messages = decode_writes(&writes.lock().unwrap());
+        assert_eq!(messages.len(), 30);
+        for (index, message) in messages.into_iter().enumerate() {
+            let key = (index / 5) as i32;
+            let input_type = (index % 5) as i32;
+            assert!(matches!(
+                message.content,
+                Some(Content::GuiSendInputEventRequest(request))
+                    if request.key == key && request.r#type == input_type
+            ));
         }
-        let _ = app.emit("flipper-disconnected", &reason);
     }
 }

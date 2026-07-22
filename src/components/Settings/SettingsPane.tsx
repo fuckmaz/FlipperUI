@@ -1,7 +1,12 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import {
+  confirm as confirmDialog,
+  open as openDialog,
+  save as saveDialog,
+} from "@tauri-apps/plugin-dialog";
+import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import {
   Wrench,
   LayoutGrid,
@@ -24,18 +29,30 @@ import {
   ExternalLink,
   GitFork,
   RefreshCw,
+  Download,
+  Upload,
+  RotateCcw,
+  LifeBuoy,
 } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { DiagPanel } from "../DevTools/DiagPanel";
 import {
   loadSettings,
+  exportSettingsJson,
+  importSettingsJson,
+  resetSettings,
   subscribeSettings,
   updateSettings,
   type AppSettings,
   type UpdateCheckFrequency,
 } from "../../lib/settings";
 import { useDirectorySuggestions } from "../../lib/useDirectorySuggestions";
-import { appIconVariants, setAppIcon, type AppIconVariant } from "../../lib/tauri";
+import {
+  appIconVariants,
+  diagEntries,
+  setAppIcon,
+  type AppIconVariant,
+} from "../../lib/tauri";
 import {
   ACCENT_PRESETS,
   FLIPPER_ORANGE,
@@ -49,6 +66,9 @@ import {
   useAppUpdateStore,
   type AppUpdateState,
 } from "../../lib/appUpdates";
+import { useFlipperStore } from "../../store/useFlipperStore";
+import { useDeviceTelemetry } from "../../lib/deviceTelemetry";
+import { serializeSupportBundle } from "../../lib/supportBundle";
 
 const IS_MACOS =
   typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
@@ -63,7 +83,17 @@ export function SettingsPane() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [diagOpen, setDiagOpen] = useState(false);
   const [iconVariants, setIconVariants] = useState<AppIconVariant[]>([]);
+  const [settingsDataBusy, setSettingsDataBusy] = useState<
+    "export" | "import" | "reset" | "support" | null
+  >(null);
+  const [settingsDataStatus, setSettingsDataStatus] = useState<{
+    message: string;
+    error: boolean;
+  } | null>(null);
   const appUpdate = useAppUpdateStore();
+  const device = useFlipperStore((state) => state.deviceInfo);
+  const connectionKind = useFlipperStore((state) => state.connectionKind);
+  const telemetry = useDeviceTelemetry();
 
   useEffect(() => {
     getVersion().then(setVersion).catch(() => {});
@@ -225,6 +255,134 @@ export function SettingsPane() {
     }
   };
 
+  const applyImportedRuntimeSettings = async (next: AppSettings) => {
+    applyAccentColor(next.appearance.themeAccent);
+    await setAppIcon(next.appearance.appIcon).catch(() => "default");
+    await invoke("set_tray_enabled", { enabled: next.tray.enabled }).catch(
+      () => {},
+    );
+    if (next.tray.enabled) {
+      await invoke("set_tray_monochrome", {
+        monochrome: next.tray.monochromeIcon,
+      }).catch(() => {});
+    }
+    await invoke("set_dock_visible", {
+      visible: !next.tray.enabled || !next.tray.hideDockIcon,
+    }).catch(() => {});
+  };
+
+  const onExportSettings = async () => {
+    setSettingsDataBusy("export");
+    setSettingsDataStatus(null);
+    try {
+      const path = await saveDialog({
+        title: "Export FlipperUI settings",
+        defaultPath: "flipperui-settings.json",
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!path) return;
+      await writeTextFile(path, await exportSettingsJson());
+      setSettingsDataStatus({ message: "Settings exported.", error: false });
+    } catch (error) {
+      setSettingsDataStatus({
+        message: `Export failed: ${errorMessage(error)}`,
+        error: true,
+      });
+    } finally {
+      setSettingsDataBusy(null);
+    }
+  };
+
+  const onImportSettings = async () => {
+    setSettingsDataBusy("import");
+    setSettingsDataStatus(null);
+    try {
+      const path = await openDialog({
+        title: "Import FlipperUI settings",
+        multiple: false,
+        directory: false,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (typeof path !== "string") return;
+      const next = await importSettingsJson(await readTextFile(path));
+      setSettings(next);
+      await applyImportedRuntimeSettings(next);
+      setSettingsDataStatus({
+        message: "Settings imported. Previous settings were backed up.",
+        error: false,
+      });
+    } catch (error) {
+      setSettingsDataStatus({
+        message: `Import failed: ${errorMessage(error)}`,
+        error: true,
+      });
+    } finally {
+      setSettingsDataBusy(null);
+    }
+  };
+
+  const onResetSettings = async () => {
+    const confirmed = await confirmDialog(
+      "Reset all FlipperUI settings to their defaults?",
+      { title: "Reset settings", kind: "warning" },
+    );
+    if (!confirmed) return;
+
+    setSettingsDataBusy("reset");
+    setSettingsDataStatus(null);
+    try {
+      const next = await resetSettings();
+      setSettings(next);
+      await applyImportedRuntimeSettings(next);
+      setSettingsDataStatus({ message: "Settings reset to defaults.", error: false });
+    } catch (error) {
+      setSettingsDataStatus({
+        message: `Reset failed: ${errorMessage(error)}`,
+        error: true,
+      });
+    } finally {
+      setSettingsDataBusy(null);
+    }
+  };
+
+  const onExportSupportBundle = async () => {
+    if (!settings) return;
+    setSettingsDataBusy("support");
+    setSettingsDataStatus(null);
+    try {
+      const path = await saveDialog({
+        title: "Export redacted FlipperUI support bundle",
+        defaultPath: `flipperui-support-${new Date().toISOString().slice(0, 10)}.json`,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!path) return;
+      const diagnostics = await diagEntries().catch(() => []);
+      const data = serializeSupportBundle({
+        generatedAt: new Date(),
+        appVersion: version,
+        platform: navigator.platform,
+        userAgent: navigator.userAgent,
+        settings,
+        device,
+        connectionKind,
+        telemetry,
+        diagnostics,
+      });
+      await writeTextFile(path, data);
+      setSettingsDataStatus({
+        message: "Redacted support bundle exported.",
+        error: false,
+      });
+    } catch (error) {
+      setSettingsDataStatus({
+        message: `Support export failed: ${errorMessage(error)}`,
+        error: true,
+      });
+    } finally {
+      setSettingsDataBusy(null);
+    }
+  };
+
   return (
     <div className="flex-1 min-h-0 overflow-y-auto">
       <div className="max-w-2xl mx-auto px-6 py-6 flex flex-col gap-4">
@@ -331,6 +489,59 @@ export function SettingsPane() {
               ))}
             </select>
           </Row>
+        </Section>
+
+        <Section icon={<Download size={13} />} title="Settings Data">
+          <p className="text-[11px] text-dim">
+            Export a portable, versioned backup or restore one. Imports are
+            validated before changes are applied and preserve the previous
+            settings as an internal rollback copy.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <SettingsDataButton
+              icon={<Download size={12} />}
+              label="Export"
+              disabled={!settings || settingsDataBusy !== null}
+              busy={settingsDataBusy === "export"}
+              onClick={() => void onExportSettings()}
+            />
+            <SettingsDataButton
+              icon={<Upload size={12} />}
+              label="Import"
+              disabled={settingsDataBusy !== null}
+              busy={settingsDataBusy === "import"}
+              onClick={() => void onImportSettings()}
+            />
+            <SettingsDataButton
+              icon={<RotateCcw size={12} />}
+              label="Reset"
+              disabled={!settings || settingsDataBusy !== null}
+              busy={settingsDataBusy === "reset"}
+              danger
+              onClick={() => void onResetSettings()}
+            />
+            <SettingsDataButton
+              icon={<LifeBuoy size={12} />}
+              label="Support bundle"
+              disabled={!settings || settingsDataBusy !== null}
+              busy={settingsDataBusy === "support"}
+              onClick={() => void onExportSupportBundle()}
+            />
+          </div>
+          <p className="text-[10px] text-dim">
+            Support bundles are capped and omit UIDs, ports, paths, secrets,
+            diagnostic details, and file payloads.
+          </p>
+          {settingsDataStatus && (
+            <p
+              role={settingsDataStatus.error ? "alert" : "status"}
+              className={`text-[11px] ${
+                settingsDataStatus.error ? "text-danger" : "text-secondary"
+              }`}
+            >
+              {settingsDataStatus.message}
+            </p>
+          )}
         </Section>
 
         <Section icon={<Palette size={13} />} title="Appearance">
@@ -666,6 +877,44 @@ function SettingsFooter({ version }: { version: string | null }) {
       </button>
     </div>
   );
+}
+
+function SettingsDataButton({
+  icon,
+  label,
+  disabled,
+  busy,
+  danger = false,
+  onClick,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  disabled: boolean;
+  busy: boolean;
+  danger?: boolean;
+  onClick: () => void;
+}) {
+  const busyLabel =
+    label === "Reset" ? "Resetting…" : label === "Import" ? "Importing…" : "Exporting…";
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={onClick}
+      className={`inline-flex items-center gap-1.5 rounded border border-border-subtle px-3 py-1.5 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+        danger
+          ? "text-danger hover:bg-danger/10"
+          : "text-secondary hover:bg-surface/60 hover:text-primary"
+      }`}
+    >
+      {busy ? <RefreshCw size={12} className="animate-spin" /> : icon}
+      {busy ? busyLabel : label}
+    </button>
+  );
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function Section({

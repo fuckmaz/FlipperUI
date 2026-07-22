@@ -7,6 +7,8 @@ import {
 } from "lucide-react";
 import { useState, type ComponentType } from "react";
 import { useFlipperStore, type ActiveView } from "../../store/useFlipperStore";
+import { resolveFeatureAvailability } from "../../lib/capabilities";
+import type { DeviceCapabilities } from "../../types/flipper";
 import { FlipperSvgIcon } from "../ui/FlipperSvgIcon";
 import subghzIconSvg from "../../assets/icons/sub1.svg?raw";
 import infraredIconSvg from "../../assets/icons/infrared.svg?raw";
@@ -37,22 +39,22 @@ interface RailItem {
    * library has at least one entry — the view is browsable offline.
    */
   browsableOffline?: "subghz" | "infrared" | "nfc" | "rfid" | "badusb";
-  /** Additionally disabled while the active transport is BLE. */
-  disabledOnBle?: boolean;
+  /** Capability fact required from the normalized connection handshake. */
+  capability?: keyof DeviceCapabilities;
 }
 
 const TOP_ITEMS: RailItem[] = [
   { view: "dashboard", label: "Dashboard", Icon: Home },
-  { view: "files", label: "File Explorer", Icon: FolderTree, requiresConnection: true },
-  { view: "apps", label: "Apps", Icon: flipperIcon(pluginsIconSvg, "plugins"), requiresConnection: true },
+  { view: "files", label: "File Explorer", Icon: FolderTree, requiresConnection: true, capability: "storage" },
+  { view: "apps", label: "Apps", Icon: flipperIcon(pluginsIconSvg, "plugins"), requiresConnection: true, capability: "storage" },
   { view: "subghz", label: "Sub-GHz", Icon: flipperIcon(subghzIconSvg, "subghz"), requiresConnection: true, browsableOffline: "subghz" },
   { view: "infrared", label: "Infrared", Icon: flipperIcon(infraredIconSvg, "infrared"), requiresConnection: true, browsableOffline: "infrared" },
   { view: "nfc", label: "NFC", Icon: flipperIcon(nfcIconSvg, "nfc"), requiresConnection: true, browsableOffline: "nfc" },
   { view: "rfid", label: "RFID", Icon: flipperIcon(rfidIconSvg, "rfid"), requiresConnection: true, browsableOffline: "rfid" },
   { view: "badusb", label: "BadUSB", Icon: flipperIcon(badusbIconSvg, "badusb"), requiresConnection: true, browsableOffline: "badusb" },
-  { view: "gpio", label: "GPIO", Icon: flipperIcon(gpioIconSvg, "gpio"), requiresConnection: true },
-  { view: "screen", label: "Screen", Icon: Monitor, requiresConnection: true },
-  { view: "cli", label: "Terminal", Icon: Terminal, requiresConnection: true, disabledOnBle: true },
+  { view: "gpio", label: "GPIO", Icon: flipperIcon(gpioIconSvg, "gpio"), requiresConnection: true, capability: "gpio" },
+  { view: "screen", label: "Screen", Icon: Monitor, requiresConnection: true, capability: "screen_stream" },
+  { view: "cli", label: "Terminal", Icon: Terminal, requiresConnection: true, capability: "cli" },
   
 ];
 
@@ -64,7 +66,7 @@ export function SideRail() {
   const activeView = useFlipperStore((s) => s.activeView);
   const setActiveView = useFlipperStore((s) => s.setActiveView);
   const isConnected = useFlipperStore((s) => s.isConnected);
-  const connectionKind = useFlipperStore((s) => s.connectionKind);
+  const deviceInfo = useFlipperStore((s) => s.deviceInfo);
   const subghzCount = useFlipperStore((s) => s.subghzEntries.length);
   const irCount = useFlipperStore((s) => s.irEntries.length);
   const nfcCount = useFlipperStore((s) => s.nfcEntries.length);
@@ -80,26 +82,33 @@ export function SideRail() {
     return badusbCount > 0;
   };
 
-  const itemDisabled = (item: RailItem): boolean => {
+  const itemDisabledReason = (item: RailItem): string | undefined => {
     if (item.requiresConnection && !isConnected) {
       if (item.browsableOffline && offlineLibraryHasEntries(item.browsableOffline)) {
-        // Fall through to the BLE check; otherwise this item is enabled.
+        // Fall through to capability checks; otherwise this item is enabled.
       } else {
-        return true;
+        return "Connect a Flipper first";
       }
     }
-    if (item.disabledOnBle && connectionKind === "ble") return true;
-    return false;
+    if (item.capability) {
+      const availability = resolveFeatureAvailability(
+        deviceInfo?.capabilities[item.capability],
+      );
+      if (!availability.available) return availability.reason;
+    }
+    return undefined;
   };
 
   const renderItem = (item: RailItem) => {
-    const disabled = itemDisabled(item);
+    const disabledReason = itemDisabledReason(item);
+    const disabled = disabledReason !== undefined;
     return (
       <RailButton
         key={item.view}
         item={item}
         active={activeView === item.view}
         disabled={disabled}
+        disabledReason={disabledReason}
         expanded={expanded}
         onClick={() => {
           if (!disabled) setActiveView(item.view);
@@ -151,12 +160,14 @@ function RailButton({
   item,
   active,
   disabled,
+  disabledReason,
   expanded,
   onClick,
 }: {
   item: RailItem;
   active: boolean;
   disabled: boolean;
+  disabledReason?: string;
   expanded: boolean;
   onClick: () => void;
 }) {
@@ -173,7 +184,7 @@ function RailButton({
       type="button"
       onClick={onClick}
       disabled={disabled}
-      title={label}
+      title={disabledReason ?? label}
       aria-label={label}
       aria-current={active && !disabled ? "page" : undefined}
       className={[

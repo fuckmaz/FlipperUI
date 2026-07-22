@@ -26,12 +26,14 @@ use crate::flipper::storage;
 /// under a synthetic "Uncategorized" bucket.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppEntry {
+    #[serde(deserialize_with = "crate::commands::path::deserialize_device_path_string")]
     pub path: String,
     /// Filename without the `.fap` suffix.
     pub name: String,
     pub category: Option<String>,
     pub size: u32,
     /// Parent root the scan discovered this app under (e.g. `/ext/apps`).
+    #[serde(deserialize_with = "crate::commands::path::deserialize_device_path_string")]
     pub root: String,
     #[serde(default)]
     pub mtime: Option<u32>,

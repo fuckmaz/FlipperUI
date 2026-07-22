@@ -1,5 +1,4 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { AlertTriangle, Usb } from "lucide-react";
 import { useFlipperStore } from "../../store/useFlipperStore";
 import { badusbCancelScan, badusbScan } from "../../lib/tauri";
@@ -7,10 +6,11 @@ import { loadSettings, subscribeSettings, updateSettings } from "../../lib/setti
 import { useLibraryPreScan } from "../../hooks/useLibraryPreScan";
 import { loadBadUsbCache, saveBadUsbCache } from "../../lib/badusbCache";
 import { notify } from "../../lib/notify";
+import { commandErrorMessage, isCommandCancelled } from "../../lib/commandError";
 import { LibraryToolbar } from "./LibraryToolbar";
 import { LibraryTable } from "./LibraryTable";
 import { Spinner } from "../ui/Spinner";
-import type { BadUsbEntry, BadUsbScanProgress } from "../../types/badusb";
+import type { BadUsbEntry } from "../../types/badusb";
 
 const USB_ROOT = "/ext/badusb";
 const KB_ROOT = "/ext/badkb";
@@ -51,21 +51,6 @@ export function BadUsbLibrary() {
     }
   }, [injection, clearInjection]);
 
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-    listen<BadUsbScanProgress>("badusb-scan-progress", (e) =>
-      setProgress(e.payload),
-    ).then((u) => {
-      if (cancelled) u();
-      else unlisten = u;
-    });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [setProgress]);
-
   // Rehydrate from disk on every deviceUid change
   useEffect(() => {
     if (!deviceUid) return;
@@ -94,7 +79,13 @@ export function BadUsbLibrary() {
         },
       );
       if (effective === null) return;
-      const list = await badusbScan(USB_ROOT, KB_ROOT, effective, entries);
+      const list = await badusbScan(
+        USB_ROOT,
+        KB_ROOT,
+        effective,
+        entries,
+        setProgress,
+      );
       setEntries(list);
       if (deviceUid) {
         await saveBadUsbCache(deviceUid, list).catch(() => {});
@@ -102,9 +93,8 @@ export function BadUsbLibrary() {
       }
       void notify("libraryScan", "BadUSB scan complete", `${list.length} entries indexed.`);
     } catch (e) {
-      const msg = (e as Error).message || String(e);
-      if (!msg.toLowerCase().includes("cancelled")) {
-        setError(`Scan failed: ${msg}`);
+      if (!isCommandCancelled(e)) {
+        setError(`Scan failed: ${commandErrorMessage(e, "badusb_scan")}`);
       }
     } finally {
       setScanning(false);

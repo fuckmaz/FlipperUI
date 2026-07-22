@@ -60,42 +60,56 @@ impl SerialTransport {
     }
 }
 
-impl Transport for SerialTransport {
-    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        // Drain pushback first.
-        let mut filled = 0;
-        while filled < buf.len() {
-            let Some(b) = self.pushback.pop_front() else {
-                break;
-            };
-            buf[filled] = b;
-            filled += 1;
-        }
-        if filled == buf.len() {
-            return Ok(());
-        }
-        // Read the rest from the port. If we time out partway, push the
-        // bytes we did get back into pushback so the caller can roll back
-        // cleanly — std `Read::read_exact` would silently drop them.
-        let start = filled;
-        while filled < buf.len() {
-            match std::io::Read::read(&mut self.port, &mut buf[filled..]) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "serial port returned 0 bytes",
-                    ));
-                }
-                Ok(n) => filled += n,
-                Err(e) => {
-                    if filled > start {
-                        self.pushback.extend(buf[start..filled].iter().copied());
-                    }
-                    return Err(e);
-                }
+fn prepend_bytes(pushback: &mut VecDeque<u8>, bytes: &[u8]) {
+    for byte in bytes.iter().rev() {
+        pushback.push_front(*byte);
+    }
+}
+
+/// Fill `buf` transactionally from pushback followed by the underlying port.
+///
+/// `Read::read_exact` cannot report how many bytes it consumed before an
+/// error. Keeping the loop here lets us restore every byte already placed in
+/// `buf`, including bytes drained from pushback, so a later framing attempt
+/// starts at the exact same byte boundary.
+fn read_exact_transactional(
+    pushback: &mut VecDeque<u8>,
+    buf: &mut [u8],
+    mut read_port: impl FnMut(&mut [u8]) -> io::Result<usize>,
+) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let Some(byte) = pushback.pop_front() else {
+            break;
+        };
+        buf[filled] = byte;
+        filled += 1;
+    }
+    while filled < buf.len() {
+        match read_port(&mut buf[filled..]) {
+            Ok(0) => {
+                prepend_bytes(pushback, &buf[..filled]);
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "serial port returned 0 bytes",
+                ));
+            }
+            Ok(read) => filled += read,
+            Err(error) => {
+                prepend_bytes(pushback, &buf[..filled]);
+                return Err(error);
             }
         }
-        Ok(())
+    }
+    Ok(())
+}
+
+impl Transport for SerialTransport {
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        let Self { port, pushback } = self;
+        read_exact_transactional(pushback, buf, |remaining| {
+            std::io::Read::read(port, remaining)
+        })
     }
 
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -123,12 +137,73 @@ impl Transport for SerialTransport {
 
     fn unread(&mut self, bytes: &[u8]) {
         // Prepend so the original byte order is preserved on next read.
-        for b in bytes.iter().rev() {
-            self.pushback.push_front(*b);
-        }
+        prepend_bytes(&mut self.pushback, bytes);
     }
 
     fn kind(&self) -> TransportKind {
         TransportKind::Serial
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transactional_exact_read_restores_pushback_and_partial_port_bytes_on_error() {
+        let mut pushback = VecDeque::from([1, 2]);
+        let mut buffer = [0; 5];
+        let mut calls = 0;
+
+        let error = read_exact_transactional(&mut pushback, &mut buffer, |remaining| {
+            calls += 1;
+            if calls == 1 {
+                remaining[..2].copy_from_slice(&[3, 4]);
+                Ok(2)
+            } else {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "test timeout"))
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(pushback, VecDeque::from([1, 2, 3, 4]));
+
+        read_exact_transactional(&mut pushback, &mut buffer, |remaining| {
+            remaining[0] = 5;
+            Ok(1)
+        })
+        .unwrap();
+        assert_eq!(buffer, [1, 2, 3, 4, 5]);
+        assert!(pushback.is_empty());
+    }
+
+    #[test]
+    fn transactional_exact_read_restores_pushback_and_partial_port_bytes_after_zero_read() {
+        let mut pushback = VecDeque::from([7]);
+        let mut buffer = [0; 4];
+        let mut calls = 0;
+
+        let error = read_exact_transactional(&mut pushback, &mut buffer, |remaining| {
+            calls += 1;
+            if calls == 1 {
+                remaining[..2].copy_from_slice(&[8, 9]);
+                Ok(2)
+            } else {
+                Ok(0)
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(pushback, VecDeque::from([7, 8, 9]));
+
+        read_exact_transactional(&mut pushback, &mut buffer, |remaining| {
+            remaining[0] = 10;
+            Ok(1)
+        })
+        .unwrap();
+        assert_eq!(buffer, [7, 8, 9, 10]);
+        assert!(pushback.is_empty());
     }
 }

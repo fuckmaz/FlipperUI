@@ -25,7 +25,6 @@ import {
   firmwareFetchDirectory,
   firmwareFlash,
   firmwareProviders,
-  onFlashProgress,
   type FirmwareCatalog,
   type FirmwareProvider,
   type FlashLevel,
@@ -33,6 +32,10 @@ import {
   type FlashSource,
   type FlashStage,
 } from "../../lib/firmware";
+import {
+  availabilityFromCommandError,
+  resolveFeatureAvailability,
+} from "../../lib/capabilities";
 
 interface Props {
   onClose: () => void;
@@ -51,7 +54,6 @@ type Phase = "idle" | "running" | "done" | "error";
 export function FirmwareFlashModal({ onClose }: Props) {
   const deviceInfo = useFlipperStore((s) => s.deviceInfo);
   const isConnected = useFlipperStore((s) => s.isConnected);
-  const connectionKind = useFlipperStore((s) => s.connectionKind);
   const setConnected = useFlipperStore((s) => s.setConnected);
 
   const [providers, setProviders] = useState<FirmwareProvider[]>([]);
@@ -108,7 +110,7 @@ export function FirmwareFlashModal({ onClose }: Props) {
       })
       .catch((e) => {
         if (cancelled) return;
-        setCatalogError(e instanceof Error ? e.message : String(e));
+        setCatalogError(availabilityFromCommandError(e).reason);
       })
       .finally(() => {
         if (!cancelled) setCatalogLoading(false);
@@ -117,34 +119,6 @@ export function FirmwareFlashModal({ onClose }: Props) {
       cancelled = true;
     };
   }, [providerId]);
-
-  // ── Live progress stream ─────────────────────────────────────────────────
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-    onFlashProgress((p: FlashProgress) => {
-      setProgress((prev) => ({ stage: p.stage, pct: p.pct ?? prev.pct }));
-      if (p.message) {
-        setLog((prev) => [
-          ...prev,
-          {
-            id: logIdRef.current++,
-            ts: Date.now(),
-            stage: p.stage,
-            level: p.level,
-            message: p.message,
-          },
-        ]);
-      }
-    }).then((u) => {
-      if (cancelled) u();
-      else unlisten = u;
-    });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, []);
 
   // ── Auto-scroll the console ──────────────────────────────────────────────
   useEffect(() => {
@@ -167,11 +141,14 @@ export function FirmwareFlashModal({ onClose }: Props) {
   const version = channel?.versions[versionIdx] ?? null;
   const installed = deviceInfo?.firmware_version ?? null;
 
-  const wrongTransport = isConnected && connectionKind !== "serial";
+  const firmwareAvailability = resolveFeatureAvailability(
+    deviceInfo?.capabilities.firmware_update,
+  );
+  const capabilityBlocked = isConnected && !firmwareAvailability.available;
   const canFlash =
     phase !== "running" &&
     isConnected &&
-    connectionKind === "serial" &&
+    firmwareAvailability.available &&
     (isLocal ? !!localFile : !!version);
 
   // Open the file picker and, if a file is chosen, switch to local mode.
@@ -192,6 +169,22 @@ export function FirmwareFlashModal({ onClose }: Props) {
 
   // Leave local mode, back to the selected online provider/channel/version.
   const useOnlineSource = useCallback(() => setSourceMode("online"), []);
+
+  const handleFlashProgress = useCallback((p: FlashProgress) => {
+    setProgress((prev) => ({ stage: p.stage, pct: p.pct ?? prev.pct }));
+    if (p.message) {
+      setLog((prev) => [
+        ...prev,
+        {
+          id: logIdRef.current++,
+          ts: Date.now(),
+          stage: p.stage,
+          level: p.level,
+          message: p.message,
+        },
+      ]);
+    }
+  }, []);
 
   const handleFlash = useCallback(async () => {
     if (!canFlash) return;
@@ -216,12 +209,12 @@ export function FirmwareFlashModal({ onClose }: Props) {
     setLog([]);
     setProgress({ stage: "download", pct: 0 });
     try {
-      await firmwareFlash(source, { clean });
+      await firmwareFlash(source, { clean }, handleFlashProgress);
       setPhase("done");
       // The device rebooted into its own updater — the RPC link is gone.
       setConnected(null);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = availabilityFromCommandError(e).reason;
       setLog((prev) => [
         ...prev,
         {
@@ -242,6 +235,7 @@ export function FirmwareFlashModal({ onClose }: Props) {
     providerId,
     channelId,
     clean,
+    handleFlashProgress,
     setConnected,
   ]);
 
@@ -271,7 +265,7 @@ export function FirmwareFlashModal({ onClose }: Props) {
           ts: Date.now(),
           stage: "error",
           level: "error",
-          message: error instanceof Error ? error.message : String(error),
+          message: availabilityFromCommandError(error).reason,
         },
       ]);
     } finally {
@@ -372,8 +366,8 @@ export function FirmwareFlashModal({ onClose }: Props) {
               title={
                 !isConnected
                   ? "Connect a Flipper to flash"
-                  : wrongTransport
-                    ? "Flashing requires a USB connection"
+                  : !firmwareAvailability.available
+                    ? firmwareAvailability.reason
                     : "Flash the selected firmware"
               }
               className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-semibold rounded bg-accent text-black hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
@@ -509,10 +503,10 @@ export function FirmwareFlashModal({ onClose }: Props) {
 
         {/* ── Footer: progress + actions ──────────────────────────────────── */}
         <footer className="px-4 py-2.5 border-t border-border-subtle bg-surface/40 flex flex-col gap-2">
-          {wrongTransport && phase === "idle" && (
+          {capabilityBlocked && phase === "idle" && (
             <div className="flex items-center gap-1.5 text-[11px] text-warning">
               <AlertTriangle size={12} />
-              Flashing requires a USB connection — reconnect over USB.
+              {firmwareAvailability.reason}
             </div>
           )}
           <div className="flex items-center gap-3">

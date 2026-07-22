@@ -3,12 +3,14 @@ use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, State};
 
-use crate::commands::client::{is_fatal_transport_error, with_client};
+use crate::commands::client::{
+    connection_handle, execute_connection, retire_connection_owner, with_connection,
+};
 use crate::error::{FlipperError, Result};
 use crate::flipper::diag;
 use crate::flipper::gpio;
 use crate::pb_gpio;
-use crate::state::{AppState, ConnectionMode};
+use crate::state::AppState;
 
 // Re-export the snapshot types so the frontend's generated bindings (and
 // `tauri::generate_handler!`) can find them through the commands module.
@@ -77,8 +79,11 @@ fn parse_pulse_duration(duration_ms: u32) -> Result<Duration> {
 
 fn pulse_failure_requires_disconnect(failure: &gpio::GpioPulseFailure) -> bool {
     failure.pin_state == gpio::GpioPulsePinState::Indeterminate
-        || is_fatal_transport_error(&failure.primary_error)
-        || failure.low_errors.iter().any(is_fatal_transport_error)
+        || crate::error::is_fatal_transport_error(&failure.primary_error)
+        || failure
+            .low_errors
+            .iter()
+            .any(crate::error::is_fatal_transport_error)
 }
 
 fn pulse_failure_message(pin: pb_gpio::GpioPin, failure: &gpio::GpioPulseFailure) -> String {
@@ -122,99 +127,66 @@ fn pulse_failure_message(pin: pb_gpio::GpioPin, failure: &gpio::GpioPulseFailure
 }
 
 /// Snapshot every GPIO pin's mode + value plus the OTG flag. Issues N+1 RPC
-/// calls sequentially under a single `with_client` so other commands don't
+/// calls sequentially under a single actor job so other commands don't
 /// observe the device mid-walk.
 #[tauri::command]
 pub async fn gpio_snapshot(state: State<'_, AppState>) -> Result<GpioSnapshot> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
-        with_client(&mode_mutex, &client_mutex, gpio::snapshot)
-    })
-    .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
+    with_connection(Arc::clone(&state.connection_owner), gpio::snapshot).await
 }
 
 #[tauri::command]
 pub async fn gpio_set_mode(pin: String, mode: String, state: State<'_, AppState>) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         let pin = parse_pin(&pin)?;
         let mode = parse_mode(&mode)?;
-        with_client(&mode_mutex, &client_mutex, |c| {
-            gpio::set_pin_mode(c, pin, mode)
-        })
+        gpio::set_pin_mode(client, pin, mode)
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 #[tauri::command]
 pub async fn gpio_get_mode(pin: String, state: State<'_, AppState>) -> Result<String> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         let pin = parse_pin(&pin)?;
-        let mode = with_client(&mode_mutex, &client_mutex, |c| gpio::get_pin_mode(c, pin))?;
+        let mode = gpio::get_pin_mode(client, pin)?;
         Ok(match mode {
             pb_gpio::GpioPinMode::Input => "input".to_string(),
             pb_gpio::GpioPinMode::Output => "output".to_string(),
         })
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 #[tauri::command]
 pub async fn gpio_set_pull(pin: String, pull: String, state: State<'_, AppState>) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         let pin = parse_pin(&pin)?;
         let pull = parse_pull(&pull)?;
-        with_client(&mode_mutex, &client_mutex, |c| {
-            gpio::set_input_pull(c, pin, pull)
-        })
+        gpio::set_input_pull(client, pin, pull)
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 #[tauri::command]
 pub async fn gpio_read_pin(pin: String, state: State<'_, AppState>) -> Result<u8> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         let pin = parse_pin(&pin)?;
-        let value = with_client(&mode_mutex, &client_mutex, |c| gpio::read_pin(c, pin))?;
+        let value = gpio::read_pin(client, pin)?;
         // The firmware returns a raw uint32 sample — clamp to 0/1 so the JS
         // side sees a tidy boolean-ish u8 matching the snapshot encoding.
         Ok(if value == 0 { 0u8 } else { 1u8 })
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 #[tauri::command]
 pub async fn gpio_write_pin(pin: String, value: u8, state: State<'_, AppState>) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         let pin = parse_pin(&pin)?;
         let value = parse_output_value(value)?;
-        with_client(&mode_mutex, &client_mutex, |c| {
-            gpio::write_pin(c, pin, value)
-        })
+        gpio::write_pin(client, pin, value)
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 /// Pulse one output pin HIGH and then LOW while retaining exclusive access to
@@ -227,90 +199,67 @@ pub async fn gpio_pulse_pin(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-    let ble_cancel_tx = Arc::clone(&state.ble_cancel_tx);
+    let pin = parse_pin(&pin)?;
+    let duration = parse_pulse_duration(duration_ms)?;
+    let owner = Arc::clone(&state.connection_owner);
+    let handle = connection_handle(&owner)?;
+    let outcome = execute_connection(&handle, move |client| {
+        Ok(gpio::pulse_pin(client, pin, duration))
+    })
+    .await?;
 
-    tauri::async_runtime::spawn_blocking(move || {
-        let pin = parse_pin(&pin)?;
-        let duration = parse_pulse_duration(duration_ms)?;
+    let failure = match outcome {
+        Ok(()) => return Ok(()),
+        Err(failure) => failure,
+    };
+    let reason = pulse_failure_message(pin, &failure);
+    let disconnect = pulse_failure_requires_disconnect(&failure);
+    diag::log_event("GpioPulseFailed", reason.clone());
 
-        {
-            let mode = mode_mutex
+    if disconnect {
+        tracing::warn!("tearing down connection after GPIO pulse failure: {reason}");
+        diag::log_event("GpioPulseConnectionTornDown", reason.clone());
+        let lifecycle = Arc::clone(&state.connection_lifecycle);
+        let _lifecycle = lifecycle.lock().await;
+        if retire_connection_owner(&owner, &handle) {
+            let _ = handle.shutdown().await;
+            if let Some(cancel) = state
+                .ble_cancel_tx
                 .lock()
-                .map_err(|_| FlipperError::Internal("Connection mode lock poisoned".into()))?;
-            if *mode == ConnectionMode::Cli {
-                return Err(FlipperError::CliModeActive);
-            }
-        }
-
-        let mut client_guard = client_mutex
-            .lock()
-            .map_err(|_| FlipperError::Internal("Client lock poisoned".into()))?;
-        let client = client_guard.as_mut().ok_or(FlipperError::NotConnected)?;
-        let failure = match gpio::pulse_pin(client, pin, duration) {
-            Ok(()) => return Ok(()),
-            Err(failure) => failure,
-        };
-
-        let reason = pulse_failure_message(pin, &failure);
-        let disconnect = pulse_failure_requires_disconnect(&failure);
-        diag::log_event("GpioPulseFailed", reason.clone());
-
-        // Clear the client before releasing its lock. No RPC can slip in
-        // between an indeterminate/fatal pulse result and teardown.
-        if disconnect {
-            *client_guard = None;
-        }
-        drop(client_guard);
-
-        if disconnect {
-            tracing::warn!("tearing down connection after GPIO pulse failure: {reason}");
-            diag::log_event("GpioPulseConnectionTornDown", reason.clone());
-            if let Ok(mut tx_guard) = ble_cancel_tx.lock() {
-                if let Some(tx) = tx_guard.take() {
-                    let _ = tx.send(());
-                }
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                let _ = cancel.send(());
             }
             let _ = app.emit("flipper-disconnected", &reason);
-        } else {
-            tracing::warn!("GPIO pulse failed with connection retained: {reason}");
         }
+    } else {
+        tracing::warn!("GPIO pulse failed with connection retained: {reason}");
+    }
 
-        Err(FlipperError::Session(reason))
-    })
-    .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
+    Err(FlipperError::Session(reason))
 }
 
 #[tauri::command]
 pub async fn gpio_get_otg(state: State<'_, AppState>) -> Result<bool> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
-        let mode = with_client(&mode_mutex, &client_mutex, gpio::get_otg_mode)?;
+    with_connection(Arc::clone(&state.connection_owner), |client| {
+        let mode = gpio::get_otg_mode(client)?;
         Ok(matches!(mode, pb_gpio::GpioOtgMode::On))
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 #[tauri::command]
 pub async fn gpio_set_otg(on: bool, state: State<'_, AppState>) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-
-    tauri::async_runtime::spawn_blocking(move || {
+    with_connection(Arc::clone(&state.connection_owner), move |client| {
         let mode = if on {
             pb_gpio::GpioOtgMode::On
         } else {
             pb_gpio::GpioOtgMode::Off
         };
-        with_client(&mode_mutex, &client_mutex, |c| gpio::set_otg_mode(c, mode))
+        gpio::set_otg_mode(client, mode)
     })
     .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
 }
 
 #[cfg(test)]

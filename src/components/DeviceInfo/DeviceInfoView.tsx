@@ -11,9 +11,9 @@ import {
   Search,
   Terminal,
 } from "lucide-react";
-import { deviceInfoAll, powerInfo, storageDu, storageInfo } from "../../lib/tauri";
 import { useFlipperStore } from "../../store/useFlipperStore";
 import { Spinner } from "../ui/Spinner";
+import { deviceTelemetry, useDeviceTelemetry } from "../../lib/deviceTelemetry";
 import type { StorageInfo as StorageInfoType } from "../../types/flipper";
 
 import blackFlipper from "../../assets/flipper-zero/FZBlackNormal.svg";
@@ -45,67 +45,28 @@ export function DeviceInfoView() {
   const isConnected = useFlipperStore((s) => s.isConnected);
   const deviceInfo = useFlipperStore((s) => s.deviceInfo);
 
-  const [info, setInfo] = useState<Record<string, string> | null>(null);
-  const [power, setPower] = useState<Record<string, string> | null>(null);
-  const [sd, setSd] = useState<StorageInfoType | null>(null);
-  // `/int` on modern firmware is a virtual folder on the SD card, so
-  // `storage_info("/int")` returns SD totals (misleading). We show the recursive
-  // byte count of `/int` contents instead — that's the actual user-visible usage.
-  const [internalBytes, setInternalBytes] = useState<number | null>(null);
-
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [fetchedAt, setFetchedAt] = useState<number | null>(null);
+  const {
+    deviceInfo: info,
+    power,
+    storage: sd,
+    internalBytes,
+    loading,
+    refreshedAt: fetchedAt,
+    errors,
+  } = useDeviceTelemetry();
+  const error = errors.deviceInfo;
   const [rawOpen, setRawOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [copiedAll, setCopiedAll] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
-  const fetchAll = async () => {
-    if (loading) return;
-    setLoading(true);
-    setError(null);
-    try {
-      // Serialize these — they all hit the same serial port via the Rust
-      // mutex, so running concurrently just means one waits anyway. Keeping
-      // them sequential gives us predictable error messages.
-      const di = await deviceInfoAll();
-      setInfo(di);
-      try {
-        setPower(await powerInfo());
-      } catch {
-        setPower(null);
-      }
-      try {
-        setSd(await storageInfo("/ext"));
-      } catch {
-        setSd(null);
-      }
-      try {
-        setInternalBytes(await storageDu("/int"));
-      } catch {
-        setInternalBytes(null);
-      }
-      setFetchedAt(Date.now());
-    } catch (e) {
-      setError((e as Error).message || String(e));
-    } finally {
-      setLoading(false);
-    }
-  };
+  const fetchAll = () => deviceTelemetry.refresh(true);
 
   useEffect(() => {
     if (!isConnected) {
-      setInfo(null);
-      setPower(null);
-      setSd(null);
-      setInternalBytes(null);
-      setError(null);
-      setFetchedAt(null);
       return;
     }
-    fetchAll();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    void deviceTelemetry.refresh(true);
   }, [isConnected]);
 
   const hardwareColor = info?.["hardware_color"] ?? "";
@@ -179,7 +140,7 @@ export function DeviceInfoView() {
             </span>
           )}
           <button
-            onClick={fetchAll}
+            onClick={() => void fetchAll()}
             disabled={loading}
             title="Refresh"
             className="flex items-center gap-1 px-2 py-1 text-[11px] text-secondary hover:text-primary border border-border-subtle rounded hover:bg-surface/60 disabled:opacity-40 disabled:cursor-not-allowed"
@@ -194,12 +155,6 @@ export function DeviceInfoView() {
         <div className="flex items-start gap-2 px-3 py-2 bg-danger/10 border-b border-danger/30 text-xs text-danger">
           <AlertTriangle size={13} className="mt-0.5 shrink-0" />
           <span className="flex-1">{error}</span>
-          <button
-            onClick={() => setError(null)}
-            className="text-danger/70 hover:text-danger"
-          >
-            ×
-          </button>
         </div>
       )}
 

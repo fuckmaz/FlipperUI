@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use serde::Deserialize;
 use tauri::AppHandle;
 
+use crate::error::{FlipperError, Result};
 use crate::{build_tray_menu, install_tray, tray_icon_for, TRAY_ID};
 
 /// Snapshot of device-side state mirrored into the tray menu. The frontend
@@ -52,13 +53,14 @@ pub fn tray_monochrome() -> bool {
 /// Show or hide the system-tray icon. Idempotent: toggling to the current
 /// state is a no-op.
 #[tauri::command]
-pub fn set_tray_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
+pub fn set_tray_enabled(app: AppHandle, enabled: bool) -> Result<()> {
     if enabled {
         // `remove_tray_by_id` returns None if no tray exists with that id, so
         // we can't use its presence to know whether to install — instead we
         // rely on `install_tray` being fine to call when none exists.
         if app.tray_by_id(TRAY_ID).is_none() {
-            install_tray(&app, tray_monochrome()).map_err(|e| e.to_string())?;
+            install_tray(&app, tray_monochrome())
+                .map_err(|error| FlipperError::Internal(error.to_string()))?;
         }
     } else {
         let _ = app.remove_tray_by_id(TRAY_ID);
@@ -69,7 +71,7 @@ pub fn set_tray_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
 /// Toggle the macOS dock icon. On non-macOS platforms this is a no-op so the
 /// frontend can call it unconditionally.
 #[tauri::command]
-pub fn set_dock_visible(app: AppHandle, visible: bool) -> Result<(), String> {
+pub fn set_dock_visible(app: AppHandle, visible: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let policy = if visible {
@@ -78,7 +80,7 @@ pub fn set_dock_visible(app: AppHandle, visible: bool) -> Result<(), String> {
             tauri::ActivationPolicy::Accessory
         };
         app.set_activation_policy(policy)
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| FlipperError::Internal(error.to_string()))?;
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -92,14 +94,18 @@ pub fn set_dock_visible(app: AppHandle, visible: bool) -> Result<(), String> {
 /// when the tray is disabled — we cache the status and replay it on the next
 /// install.
 #[tauri::command]
-pub fn update_tray_status(app: AppHandle, status: TrayStatus) -> Result<(), String> {
+pub fn update_tray_status(app: AppHandle, status: TrayStatus) -> Result<()> {
     {
-        let mut guard = TRAY_STATUS.lock().map_err(|e| e.to_string())?;
+        let mut guard = TRAY_STATUS
+            .lock()
+            .map_err(|error| FlipperError::Internal(error.to_string()))?;
         *guard = Some(status.clone());
     }
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let menu = build_tray_menu(&app, &status).map_err(|e| e.to_string())?;
-        tray.set_menu(Some(menu)).map_err(|e| e.to_string())?;
+        let menu = build_tray_menu(&app, &status)
+            .map_err(|error| FlipperError::Internal(error.to_string()))?;
+        tray.set_menu(Some(menu))
+            .map_err(|error| FlipperError::Internal(error.to_string()))?;
     }
     Ok(())
 }
@@ -109,11 +115,13 @@ pub fn update_tray_status(app: AppHandle, status: TrayStatus) -> Result<(), Stri
 /// macOS). Persists for the rest of the process so any future re-install
 /// (after toggling tray off → on) keeps the chosen style.
 #[tauri::command]
-pub fn set_tray_monochrome(app: AppHandle, monochrome: bool) -> Result<(), String> {
+pub fn set_tray_monochrome(app: AppHandle, monochrome: bool) -> Result<()> {
     TRAY_MONOCHROME.store(monochrome, Ordering::Relaxed);
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let icon = tray_icon_for(&app, monochrome).map_err(|e| e.to_string())?;
-        tray.set_icon(Some(icon)).map_err(|e| e.to_string())?;
+        let icon = tray_icon_for(&app, monochrome)
+            .map_err(|error| FlipperError::Internal(error.to_string()))?;
+        tray.set_icon(Some(icon))
+            .map_err(|error| FlipperError::Internal(error.to_string()))?;
         // Template flag controls macOS auto-tinting; setting it on non-mac
         // platforms is harmless.
         let _ = tray.set_icon_as_template(monochrome);

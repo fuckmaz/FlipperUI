@@ -37,6 +37,7 @@ pub struct IrSignal {
 /// Parsed metadata for a single .ir file (a remote).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IrEntry {
+    #[serde(deserialize_with = "crate::commands::path::deserialize_device_path_string")]
     pub path: String,
     pub name: String,
     pub signals: Vec<IrSignal>,

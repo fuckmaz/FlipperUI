@@ -1,5 +1,4 @@
 import { useCallback } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import {
   storageList,
@@ -14,6 +13,10 @@ import { joinPath } from "../lib/encoding";
 import { basename } from "../lib/path";
 import { notify } from "../lib/notify";
 import { useFlipperStore } from "../store/useFlipperStore";
+import {
+  commandErrorMessage,
+  isCommandCancelled,
+} from "../lib/commandError";
 
 export interface StorageDeleteTarget {
   name: string;
@@ -57,7 +60,7 @@ export function useStorage() {
       });
       setEntries(entries);
     } catch (e: unknown) {
-      setError(String(e));
+      setError(commandErrorMessage(e, "storage_list"));
     } finally {
       setLoading(false);
     }
@@ -67,7 +70,6 @@ export function useStorage() {
     if (useFlipperStore.getState().fileBrowserDeleting) return;
     const currentPath = useFlipperStore.getState().currentPath;
     const remotePath = joinPath(currentPath, name);
-    let unlisten: (() => void) | undefined;
     let failed = false;
     try {
       const savePath = await save({ defaultPath: name });
@@ -75,21 +77,17 @@ export function useStorage() {
 
       setTransferProgress(0);
 
-      unlisten = await listen<number>("download-progress", (event) => {
-        setTransferProgress(event.payload);
+      await storageReadToLocal(remotePath, savePath, (progress) => {
+        setTransferProgress(progress.percent);
       });
-
-      await storageReadToLocal(remotePath, savePath);
       setTransferProgress(100);
       void notify("transfer", "Download complete", name);
     } catch (e: unknown) {
       failed = true;
-      const msg = String(e);
-      if (!msg.includes("Transfer cancelled")) {
-        setError(msg);
+      if (!isCommandCancelled(e)) {
+        setError(commandErrorMessage(e, "storage_read_to_local"));
       }
     } finally {
-      unlisten?.();
       if (failed) {
         setTransferProgress(null);
       } else {
@@ -105,7 +103,6 @@ export function useStorage() {
     if (useFlipperStore.getState().fileBrowserDeleting) return;
     const currentPath = useFlipperStore.getState().currentPath;
     const remotePath = joinPath(currentPath, name);
-    let unlisten: (() => void) | undefined;
     let failed = false;
     try {
       const parentDir = await open({ directory: true, multiple: false });
@@ -117,21 +114,17 @@ export function useStorage() {
 
       setTransferProgress(0);
 
-      unlisten = await listen<number>("download-progress", (event) => {
-        setTransferProgress(event.payload);
+      await storageReadDirToLocal(remotePath, localDest, (progress) => {
+        setTransferProgress(progress.percent);
       });
-
-      await storageReadDirToLocal(remotePath, localDest);
       setTransferProgress(100);
       void notify("transfer", "Folder download complete", name);
     } catch (e: unknown) {
       failed = true;
-      const msg = String(e);
-      if (!msg.includes("Transfer cancelled")) {
-        setError(msg);
+      if (!isCommandCancelled(e)) {
+        setError(commandErrorMessage(e, "storage_read_dir_to_local"));
       }
     } finally {
-      unlisten?.();
       if (failed) {
         setTransferProgress(null);
       } else {
@@ -146,7 +139,6 @@ export function useStorage() {
     if (useFlipperStore.getState().fileBrowserDeleting) return;
     const currentPath = useFlipperStore.getState().currentPath;
     const dir = destDir ?? currentPath;
-    let unlisten: (() => void) | undefined;
     let failed = false;
     try {
       const fileName = basename(localPath) || "file";
@@ -154,11 +146,9 @@ export function useStorage() {
 
       setTransferProgress(0);
 
-      unlisten = await listen<number>("upload-progress", (event) => {
-        setTransferProgress(event.payload);
+      await storageWriteFromLocal(remotePath, localPath, (progress) => {
+        setTransferProgress(progress.percent);
       });
-
-      await storageWriteFromLocal(remotePath, localPath);
 
       // Only refresh the visible listing when the upload landed there;
       // otherwise the user is still looking at currentPath and we'd flicker.
@@ -166,12 +156,10 @@ export function useStorage() {
       void notify("transfer", "Upload complete", basename(localPath) || "file");
     } catch (e: unknown) {
       failed = true;
-      const msg = String(e);
-      if (!msg.includes("Transfer cancelled")) {
-        setError(msg);
+      if (!isCommandCancelled(e)) {
+        setError(commandErrorMessage(e, "storage_write_from_local"));
       }
     } finally {
-      unlisten?.();
       if (failed) {
         setTransferProgress(null);
       } else {
@@ -198,7 +186,7 @@ export function useStorage() {
       await storageMkdir(path);
       await refresh(currentPath);
     } catch (e: unknown) {
-      setError(String(e));
+      setError(commandErrorMessage(e, "storage_mkdir"));
     }
   }, [setError, refresh]);
 
@@ -212,7 +200,7 @@ export function useStorage() {
       await storageRename(oldPath, newPath);
       await refresh(currentPath);
     } catch (e: unknown) {
-      setError(String(e));
+      setError(commandErrorMessage(e, "storage_rename"));
     }
   }, [setError, refresh]);
 
@@ -264,7 +252,7 @@ export function useStorage() {
         })),
       };
     } catch (e: unknown) {
-      const reason = String(e);
+      const reason = commandErrorMessage(e, "storage_delete_many");
       result = {
         deleted: [],
         failed: [],

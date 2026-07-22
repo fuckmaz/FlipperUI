@@ -320,11 +320,7 @@ pub fn storage_du(client: &mut FlipperClient, path: &str) -> Result<u64> {
         for e in entries {
             // FileType::DIR = 1 in the protobuf.
             if e.r#type == 1 {
-                let sub = if dir.ends_with('/') {
-                    format!("{dir}{}", e.name)
-                } else {
-                    format!("{dir}/{}", e.name)
-                };
+                let sub = crate::flipper::library_walk::join_path(&dir, &e.name)?;
                 queue.push(sub);
             } else {
                 total = total.saturating_add(e.size as u64);

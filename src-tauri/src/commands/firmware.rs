@@ -8,18 +8,19 @@
 
 use std::cell::Cell;
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{ipc::Channel, State};
 
+use crate::commands::client::{connection_handle, execute_connection, retire_connection_owner};
 use crate::error::{FlipperError, Result};
 use crate::flipper::client::FlipperClient;
-use crate::flipper::{diag, firmware};
+use crate::flipper::firmware;
 use crate::flipper::{session, storage};
-use crate::state::{
-    AppState, ConnectionMode, FirmwareCancelOutcome, FirmwareCommitOutcome, FirmwareOperationState,
-};
+use crate::operation::{CancelOutcome, CommitOutcome, OperationName, OperationRegistry};
+use crate::state::AppState;
 
 /// Static descriptor of a firmware source, surfaced to the source picker.
 #[derive(Serialize)]
@@ -34,7 +35,9 @@ pub struct ProviderInfo {
 /// `message` empty == a pure progress tick (move the footer bar, don't log a
 /// line). Non-empty == a log line. `pct` is present for `download`/`upload`.
 #[derive(Serialize, Clone)]
-struct FlashProgress {
+pub struct FlashProgress {
+    #[serde(rename = "operationId")]
+    operation_id: u64,
     /// download | verify | prepare | upload | install | reboot | done | error
     stage: String,
     message: String,
@@ -48,6 +51,7 @@ struct FlashProgress {
 pub enum FirmwareCancelStatus {
     Cancelled,
     TooLate,
+    StaleOperation,
     NoActiveOperation,
 }
 
@@ -81,16 +85,21 @@ pub struct FlashOptions {
     clean: bool,
 }
 
-fn emit(app: &AppHandle, stage: &str, level: &str, message: impl Into<String>, pct: Option<u32>) {
-    let _ = app.emit(
-        "firmware-flash-progress",
-        FlashProgress {
-            stage: stage.to_string(),
-            message: message.into(),
-            pct,
-            level: level.to_string(),
-        },
-    );
+fn emit(
+    on_progress: &Channel<FlashProgress>,
+    operation_id: u64,
+    stage: &str,
+    level: &str,
+    message: impl Into<String>,
+    pct: Option<u32>,
+) {
+    let _ = on_progress.send(FlashProgress {
+        operation_id,
+        stage: stage.to_string(),
+        message: message.into(),
+        pct,
+        level: level.to_string(),
+    });
 }
 
 fn human_size(bytes: u64) -> String {
@@ -113,42 +122,6 @@ fn overall_pct(done: u64, total: u64) -> u32 {
     ((done.saturating_mul(100)) / total).min(100) as u32
 }
 
-struct FirmwareOperationGuard {
-    state: Arc<Mutex<FirmwareOperationState>>,
-    operation_id: u64,
-}
-
-impl Drop for FirmwareOperationGuard {
-    fn drop(&mut self) {
-        match self.state.lock() {
-            Ok(mut state) => state.finish(self.operation_id),
-            Err(poisoned) => poisoned.into_inner().finish(self.operation_id),
-        }
-    }
-}
-
-fn begin_firmware_operation(
-    state: Arc<Mutex<FirmwareOperationState>>,
-) -> Result<FirmwareOperationGuard> {
-    let operation_id = state
-        .lock()
-        .map_err(|_| FlipperError::Internal("firmware operation state is poisoned".into()))?
-        .begin()
-        .ok_or_else(|| FlipperError::Internal("a firmware flash is already in progress".into()))?;
-    Ok(FirmwareOperationGuard {
-        state,
-        operation_id,
-    })
-}
-
-fn firmware_operation_cancelled(state: &Mutex<FirmwareOperationState>, operation_id: u64) -> bool {
-    match state.lock() {
-        Ok(state) => state.is_cancelled(operation_id),
-        // A poisoned operation state cannot safely authorize a mutation.
-        Err(_) => true,
-    }
-}
-
 fn ensure_not_cancelled(cancelled: &dyn Fn() -> bool) -> Result<()> {
     if cancelled() {
         Err(FlipperError::TransferCancelled)
@@ -157,15 +130,12 @@ fn ensure_not_cancelled(cancelled: &dyn Fn() -> bool) -> Result<()> {
     }
 }
 
-fn begin_firmware_commit(state: &Mutex<FirmwareOperationState>, operation_id: u64) -> Result<()> {
-    let outcome = state
-        .lock()
-        .map_err(|_| FlipperError::Internal("firmware operation state is poisoned".into()))?
-        .begin_commit(operation_id);
+fn begin_firmware_commit(registry: &OperationRegistry, operation_id: u64) -> Result<()> {
+    let outcome = registry.begin_commit(OperationName::Firmware, operation_id);
     match outcome {
-        FirmwareCommitOutcome::Started => Ok(()),
-        FirmwareCommitOutcome::Cancelled => Err(FlipperError::TransferCancelled),
-        FirmwareCommitOutcome::NotActive => Err(FlipperError::Internal(
+        CommitOutcome::Started => Ok(()),
+        CommitOutcome::Cancelled => Err(FlipperError::TransferCancelled),
+        CommitOutcome::Stale => Err(FlipperError::Internal(
             "firmware operation is no longer active".into(),
         )),
     }
@@ -175,24 +145,30 @@ fn begin_firmware_commit(state: &Mutex<FirmwareOperationState>, operation_id: u6
 /// updater-request commit barrier, cancellation cannot safely claim success:
 /// the device may already be staging or rebooting.
 #[tauri::command]
-pub fn cancel_firmware_flash(state: State<AppState>) -> Result<FirmwareCancelResponse> {
+pub fn cancel_firmware_flash(
+    operation_id: u64,
+    state: State<AppState>,
+) -> Result<FirmwareCancelResponse> {
     let outcome = state
-        .firmware_operation
-        .lock()
-        .map_err(|_| FlipperError::Internal("firmware operation state is poisoned".into()))?
-        .cancel_active();
+        .operations
+        .cancel(OperationName::Firmware, operation_id);
     let response = match outcome {
-        FirmwareCancelOutcome::Cancelled => FirmwareCancelResponse {
+        CancelOutcome::Requested | CancelOutcome::AlreadyRequested => FirmwareCancelResponse {
             status: FirmwareCancelStatus::Cancelled,
             message: "Firmware cancellation requested".into(),
         },
-        FirmwareCancelOutcome::TooLate => FirmwareCancelResponse {
+        CancelOutcome::TooLate => FirmwareCancelResponse {
             status: FirmwareCancelStatus::TooLate,
             message: "The updater request has started; it is too late to cancel safely".into(),
         },
-        FirmwareCancelOutcome::NoActiveOperation => FirmwareCancelResponse {
+        CancelOutcome::Stale => FirmwareCancelResponse {
+            status: FirmwareCancelStatus::StaleOperation,
+            message: "That firmware operation has already finished; cancellation was rejected"
+                .into(),
+        },
+        CancelOutcome::Unknown => FirmwareCancelResponse {
             status: FirmwareCancelStatus::NoActiveOperation,
-            message: "No firmware flash is active".into(),
+            message: "No matching firmware flash is active".into(),
         },
     };
     Ok(response)
@@ -201,6 +177,7 @@ pub fn cancel_firmware_flash(state: State<AppState>) -> Result<FirmwareCancelRes
 /// Send the UPDATE reboot and always invalidate the client slot afterwards.
 /// Even a reported write failure may have partially reached the device, so the
 /// old transport must never be reused.
+#[cfg(test)]
 fn reboot_into_updater(client_slot: &mut Option<FlipperClient>) -> Result<()> {
     let result = match client_slot.as_mut() {
         Some(client) => session::reboot(client, 2),
@@ -231,6 +208,7 @@ fn ignore_not_exist(r: Result<()>) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 fn is_fatal_device_error(error: &FlipperError) -> bool {
     match error {
         FlipperError::Serial(_) => true,
@@ -317,25 +295,36 @@ pub async fn firmware_flash(
     source: FlashSource,
     options: FlashOptions,
     state: State<'_, AppState>,
-    app: AppHandle,
+    on_progress: Channel<FlashProgress>,
 ) -> Result<()> {
-    let client_mutex = Arc::clone(&state.client);
-    let mode_mutex = Arc::clone(&state.mode);
-    let ble_cancel_tx = Arc::clone(&state.ble_cancel_tx);
-    let firmware_operation = Arc::clone(&state.firmware_operation);
-    let operation_guard = begin_firmware_operation(Arc::clone(&firmware_operation))?;
-    let operation_id = operation_guard.operation_id;
+    let owner = Arc::clone(&state.connection_owner);
+    let operations = Arc::clone(&state.operations);
+    let operation = operations.begin(OperationName::Firmware)?;
+    let operation_id = operation.id();
+    let cancelled = operation.cancel_token();
+    emit(
+        &on_progress,
+        operation_id,
+        "download",
+        "info",
+        "Preparing firmware operation…",
+        Some(0),
+    );
+    let committed = Arc::new(AtomicBool::new(false));
+    let committed_in_job = Arc::clone(&committed);
+    let handle = connection_handle(&owner)?;
 
-    tauri::async_runtime::spawn_blocking(move || {
-        let _operation_guard = operation_guard;
-        let is_cancelled = || firmware_operation_cancelled(&firmware_operation, operation_id);
+    let result = execute_connection(&handle, move |client| {
+        let _operation = operation;
+        let is_cancelled = || cancelled.load(Ordering::Acquire);
         ensure_not_cancelled(&is_cancelled)?;
 
         // ── 1. Acquire the bundle bytes ────────────────────────────────────
         let (bytes, expected_sha256): (Vec<u8>, Option<String>) = match source {
             FlashSource::Local { local_path } => {
                 emit(
-                    &app,
+                    &on_progress,
+                    operation_id,
                     "download",
                     "info",
                     format!("Reading {local_path}"),
@@ -343,7 +332,8 @@ pub async fn firmware_flash(
                 );
                 let data = firmware::read_local_archive(std::path::Path::new(&local_path))?;
                 emit(
-                    &app,
+                    &on_progress,
+                    operation_id,
                     "download",
                     "ok",
                     format!(
@@ -366,7 +356,8 @@ pub async fn firmware_flash(
                     FlipperError::Internal(format!("unknown firmware provider: {provider_id}"))
                 })?;
                 emit(
-                    &app,
+                    &on_progress,
+                    operation_id,
                     "download",
                     "info",
                     "Resolving the selected build from the provider catalog…",
@@ -380,14 +371,15 @@ pub async fn firmware_flash(
                     &selection_token,
                 )?;
                 emit(
-                    &app,
+                    &on_progress,
+                    operation_id,
                     "download",
                     "info",
                     format!("Downloading {}", resolved.label),
                     Some(0),
                 );
                 let last_pct = Cell::new(-1i32);
-                let app_dl = app.clone();
+                let download_progress = on_progress.clone();
                 let data = firmware::download(
                     &resolved.url,
                     provider.download_hosts,
@@ -395,13 +387,21 @@ pub async fn firmware_flash(
                         let pct = overall_pct(done, total) as i32;
                         if pct != last_pct.get() {
                             last_pct.set(pct);
-                            emit(&app_dl, "download", "info", "", Some(pct as u32));
+                            emit(
+                                &download_progress,
+                                operation_id,
+                                "download",
+                                "info",
+                                "",
+                                Some(pct as u32),
+                            );
                         }
                     },
                     &is_cancelled,
                 )?;
                 emit(
-                    &app,
+                    &on_progress,
+                    operation_id,
                     "download",
                     "ok",
                     format!("Downloaded {}", human_size(data.len() as u64)),
@@ -420,11 +420,19 @@ pub async fn firmware_flash(
         // Local archives have no trusted expected value, but remain fully
         // subject to the structural and resource validation below.
         if let Some(expected) = expected_sha256 {
-            emit(&app, "verify", "info", "Verifying SHA-256…", None);
+            emit(
+                &on_progress,
+                operation_id,
+                "verify",
+                "info",
+                "Verifying SHA-256…",
+                None,
+            );
             let actual = firmware::sha256_hex(&bytes);
             if !actual.eq_ignore_ascii_case(&expected) {
                 emit(
-                    &app,
+                    &on_progress,
+                    operation_id,
                     "verify",
                     "error",
                     "Checksum mismatch — aborting",
@@ -434,10 +442,18 @@ pub async fn firmware_flash(
                     "SHA-256 mismatch: the download is corrupt or was tampered with".into(),
                 ));
             }
-            emit(&app, "verify", "ok", "Checksum verified", None);
+            emit(
+                &on_progress,
+                operation_id,
+                "verify",
+                "ok",
+                "Checksum verified",
+                None,
+            );
         } else {
             emit(
-                &app,
+                &on_progress,
+                operation_id,
                 "verify",
                 "info",
                 "Local archive — validating structure and resource limits",
@@ -446,13 +462,21 @@ pub async fn firmware_flash(
         }
 
         // ── 3. Unpack the .tgz ─────────────────────────────────────────────
-        emit(&app, "prepare", "info", "Unpacking update bundle…", None);
+        emit(
+            &on_progress,
+            operation_id,
+            "prepare",
+            "info",
+            "Unpacking update bundle…",
+            None,
+        );
         let bundle = firmware::unpack_update_archive(&bytes)?;
         let dir = format!("/ext/update/{}", bundle.top_dir);
         let manifest_path = format!("{dir}/{}", bundle.manifest_rel);
         let total = bundle.total_bytes();
         emit(
-            &app,
+            &on_progress,
+            operation_id,
             "prepare",
             "ok",
             format!("{} files · {}", bundle.files.len(), human_size(total)),
@@ -460,24 +484,21 @@ pub async fn firmware_flash(
         );
 
         // ── 4. Device IO: upload → stage update → reboot ───────────────────
-        // Lock the client manually (rather than `with_client`) so we can drop
-        // it after the reboot, matching the `reboot` command — the serial port
-        // vanishes the instant the device reboots into the updater.
-        {
-            let conn_mode = mode_mutex.lock().unwrap();
-            if *conn_mode == ConnectionMode::Cli {
-                return Err(FlipperError::CliModeActive);
-            }
-            drop(conn_mode);
-        }
-        let mut guard = client_mutex.lock().unwrap();
+        // This complete sequence is one actor job, so no other RPC can observe
+        // a partially-cleaned or partially-uploaded staging directory.
         let device_result: Result<()> = (|| {
-            let client = guard.as_mut().ok_or(FlipperError::NotConnected)?;
             ensure_not_cancelled(&is_cancelled)?;
 
             if options.clean {
                 ensure_not_cancelled(&is_cancelled)?;
-                emit(&app, "upload", "info", "Clearing /ext/update…", None);
+                emit(
+                    &on_progress,
+                    operation_id,
+                    "upload",
+                    "info",
+                    "Clearing /ext/update…",
+                    None,
+                );
                 ignore_not_exist(storage::storage_delete(client, &dir, true))?;
             }
 
@@ -501,7 +522,8 @@ pub async fn firmware_flash(
                 ensure_not_cancelled(&is_cancelled)?;
                 let remote = format!("{dir}/{}", file.rel_path);
                 emit(
-                    &app,
+                    &on_progress,
+                    operation_id,
                     "upload",
                     "info",
                     format!(
@@ -512,7 +534,7 @@ pub async fn firmware_flash(
                     Some(overall_pct(done, total)),
                 );
                 let start = done;
-                let app_up = app.clone();
+                let upload_progress = on_progress.clone();
                 storage::storage_write(
                     client,
                     &remote,
@@ -522,7 +544,14 @@ pub async fn firmware_flash(
                         let pct = overall_pct(cur, total) as i32;
                         if pct != last_up_pct.get() {
                             last_up_pct.set(pct);
-                            emit(&app_up, "upload", "info", "", Some(pct as u32));
+                            emit(
+                                &upload_progress,
+                                operation_id,
+                                "upload",
+                                "info",
+                                "",
+                                Some(pct as u32),
+                            );
                         }
                     },
                     is_cancelled,
@@ -531,7 +560,14 @@ pub async fn firmware_flash(
                 done = done.saturating_add(file.data.len() as u64);
             }
             ensure_not_cancelled(&is_cancelled)?;
-            emit(&app, "upload", "ok", "Upload complete", Some(100));
+            emit(
+                &on_progress,
+                operation_id,
+                "upload",
+                "ok",
+                "Upload complete",
+                Some(100),
+            );
 
             // Atomically cross the irreversible boundary immediately before
             // the updater request. A concurrent cancel either marks the
@@ -539,21 +575,51 @@ pub async fn firmware_flash(
             // and reports that it is too late. Once committed, request_update
             // and reboot are one uninterrupted sequence.
             ensure_not_cancelled(&is_cancelled)?;
-            emit(&app, "install", "info", "Sending update request…", None);
-            begin_firmware_commit(&firmware_operation, operation_id)?;
+            emit(
+                &on_progress,
+                operation_id,
+                "install",
+                "info",
+                "Sending update request…",
+                None,
+            );
+            begin_firmware_commit(&operations, operation_id)?;
+            committed_in_job.store(true, Ordering::Release);
             let code = session::request_update(client, &manifest_path)?;
             if code != 0 {
                 let msg = update_code_message(code);
-                emit(&app, "install", "error", msg.clone(), None);
+                emit(
+                    &on_progress,
+                    operation_id,
+                    "install",
+                    "error",
+                    msg.clone(),
+                    None,
+                );
                 return Err(FlipperError::Internal(msg));
             }
-            emit(&app, "install", "ok", "Update staged on device", None);
+            emit(
+                &on_progress,
+                operation_id,
+                "install",
+                "ok",
+                "Update staged on device",
+                None,
+            );
 
-            emit(&app, "reboot", "info", "Rebooting into updater…", None);
-            let reboot_result = reboot_into_updater(&mut guard);
+            emit(
+                &on_progress,
+                operation_id,
+                "reboot",
+                "info",
+                "Rebooting into updater…",
+                None,
+            );
+            let reboot_result = session::reboot(client, 2);
             if let Err(error) = reboot_result {
                 emit(
-                    &app,
+                    &on_progress,
+                    operation_id,
                     "reboot",
                     "error",
                     "Updater start is indeterminate — check the device screen and reconnect before retrying",
@@ -563,27 +629,11 @@ pub async fn firmware_flash(
             }
             Ok(())
         })();
-        drop(guard);
-
-        if let Err(error) = &device_result {
-            if is_fatal_device_error(error) {
-                tracing::warn!("tearing down connection after firmware RPC failure: {error}");
-                diag::log_event("FirmwareConnectionTornDown", error.to_string());
-                if let Ok(mut guard) = client_mutex.lock() {
-                    *guard = None;
-                }
-                if let Ok(mut tx_guard) = ble_cancel_tx.lock() {
-                    if let Some(tx) = tx_guard.take() {
-                        let _ = tx.send(());
-                    }
-                }
-                let _ = app.emit("flipper-disconnected", error.to_string());
-            }
-        }
         device_result?;
 
         emit(
-            &app,
+            &on_progress,
+            operation_id,
             "done",
             "ok",
             "Updater started — follow progress on the device screen; installation is not yet verified",
@@ -591,8 +641,27 @@ pub async fn firmware_flash(
         );
         Ok(())
     })
-    .await
-    .map_err(|e| FlipperError::Internal(e.to_string()))?
+    .await;
+
+    // Once the updater request begins, the old transport is never reusable,
+    // even if the reboot write reports an error after partially reaching the
+    // device. Retire the actor rather than returning its client to shared state.
+    if committed.load(Ordering::Acquire) {
+        let lifecycle = Arc::clone(&state.connection_lifecycle);
+        let _lifecycle = lifecycle.lock().await;
+        if retire_connection_owner(&owner, &handle) {
+            let _ = handle.shutdown().await;
+            if let Some(cancel) = state
+                .ble_cancel_tx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                let _ = cancel.send(());
+            }
+        }
+    }
+    result
 }
 
 fn short_name(path: &str) -> String {

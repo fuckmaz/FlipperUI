@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import {
   Battery,
   BatteryCharging,
@@ -14,11 +14,12 @@ import {
   Zap,
 } from "lucide-react";
 import { useFlipperStore } from "../../store/useFlipperStore";
-import { powerInfo, storageDu, storageInfo } from "../../lib/tauri";
+import { deviceTelemetry, useDeviceTelemetry } from "../../lib/deviceTelemetry";
 import { FlipperSvgIcon } from "../ui/FlipperSvgIcon";
 import { DeviceSettingsCard } from "../DeviceSettings/DeviceSettingsCard";
 import { FirmwareFlashModal } from "../FirmwareFlash/FirmwareFlashModal";
 import type { StorageInfo as StorageInfoType } from "../../types/flipper";
+import { resolveFeatureAvailability } from "../../lib/capabilities";
 
 import blackFlipper from "../../assets/flipper-zero/FZBlackNormal.svg";
 import whiteFlipper from "../../assets/flipper-zero/FZWhiteNormal.svg";
@@ -37,8 +38,6 @@ const flipperVariants: Record<string, string> = {
   "3": transparentFlipper,
 };
 
-const REFRESH_INTERVAL_MS = 30_000;
-
 export function Dashboard() {
   const isConnected = useFlipperStore((s) => s.isConnected);
   const deviceInfo = useFlipperStore((s) => s.deviceInfo);
@@ -51,55 +50,14 @@ export function Dashboard() {
   const badusbCount = useFlipperStore((s) => s.badusbEntries.length);
   const appsCount = useFlipperStore((s) => s.appEntries.length);
 
-  const [power, setPower] = useState<Record<string, string> | null>(null);
-  const [sd, setSd] = useState<StorageInfoType | null>(null);
-  const [internalBytes, setInternalBytes] = useState<number | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [refreshedAt, setRefreshedAt] = useState<number | null>(null);
+  const {
+    power,
+    storage: sd,
+    internalBytes,
+    loading,
+    refreshedAt,
+  } = useDeviceTelemetry();
   const [showFirmware, setShowFirmware] = useState(false);
-  const inflight = useRef(false);
-
-  const refresh = useCallback(async () => {
-    if (inflight.current) return;
-    inflight.current = true;
-    setLoading(true);
-    try {
-      // Sequential: same serial mutex on the Rust side, so concurrency just
-      // serializes anyway and predictable error attribution is easier.
-      try {
-        setPower(await powerInfo());
-      } catch {
-        setPower(null);
-      }
-      try {
-        setSd(await storageInfo("/ext"));
-      } catch {
-        setSd(null);
-      }
-      try {
-        setInternalBytes(await storageDu("/int"));
-      } catch {
-        setInternalBytes(null);
-      }
-      setRefreshedAt(Date.now());
-    } finally {
-      setLoading(false);
-      inflight.current = false;
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!isConnected) {
-      setPower(null);
-      setSd(null);
-      setInternalBytes(null);
-      setRefreshedAt(null);
-      return;
-    }
-    void refresh();
-    const id = window.setInterval(() => void refresh(), REFRESH_INTERVAL_MS);
-    return () => window.clearInterval(id);
-  }, [isConnected, refresh]);
 
   const hardwareColor = deviceInfo?.hardware_name?.includes("Black")
     ? "1"
@@ -108,15 +66,15 @@ export function Dashboard() {
       : "3";
   const flipperImg = flipperVariants[hardwareColor] ?? whiteFlipper;
 
-  // Firmware flashing is USB-only for now. Flashing over BLE is technically
-  // possible but the multi-MB upload at BLE's small chunk size would be
-  // painfully slow, so we deliberately gate the tool to a serial connection.
-  const usbConnected = isConnected && connectionKind === "serial";
+  const firmwareAvailability = resolveFeatureAvailability(
+    deviceInfo?.capabilities.firmware_update,
+  );
+  const firmwareEnabled = isConnected && firmwareAvailability.available;
   const firmwareTooltip = !isConnected
     ? "Connect a Flipper via USB to flash firmware."
-    : connectionKind !== "serial"
-      ? "Firmware flash is USB-only for now — reconnect over USB to flash."
-      : "Flash firmware — USB only.";
+    : firmwareAvailability.available
+      ? "Flash firmware."
+      : firmwareAvailability.reason;
 
   return (
     <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
@@ -134,7 +92,7 @@ export function Dashboard() {
             </span>
           )}
           <button
-            onClick={() => void refresh()}
+            onClick={() => void deviceTelemetry.refresh()}
             disabled={!isConnected || loading}
             title={isConnected ? "Refresh" : "Connect to refresh"}
             className="flex items-center gap-1 px-2 py-1 text-[11px] text-secondary hover:text-primary border border-border-subtle rounded hover:bg-surface/60 disabled:opacity-40 disabled:cursor-not-allowed"
@@ -187,7 +145,7 @@ export function Dashboard() {
                 <button
                   type="button"
                   onClick={() => setShowFirmware(true)}
-                  disabled={!usbConnected}
+                  disabled={!firmwareEnabled}
                   aria-label="Open firmware flash tool"
                   className="flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium text-black bg-accent hover:bg-accent-hover rounded shadow-sm disabled:opacity-40 disabled:pointer-events-none transition-colors"
                 >
