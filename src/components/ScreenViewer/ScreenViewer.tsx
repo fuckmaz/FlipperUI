@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -9,6 +9,11 @@ import { screenStreamStart, screenStreamStop, sendInputEvent } from "../../lib/t
 import { base64ToUint8Array } from "../../lib/encoding";
 import { loadSettings, subscribeSettings, type AppSettings } from "../../lib/settings";
 import { Spinner } from "../ui/Spinner";
+import {
+  createScreenInputController,
+  INPUT_REPEAT,
+  type ScreenInputController,
+} from "./screenInput";
 
 const SCREEN_W = 128;
 const SCREEN_H = 64;
@@ -33,19 +38,9 @@ const GIF_PALETTE: [number, number, number][] = [
 
 // InputKey enum values from Flipper protobuf
 const KEY_UP = 0, KEY_DOWN = 1, KEY_RIGHT = 2, KEY_LEFT = 3, KEY_OK = 4, KEY_BACK = 5;
-// We only ever emit SHORT or LONG; the backend brackets each one with the
-// PRESS / RELEASE the firmware needs (see `write_input` in commands/gui.rs).
-const INPUT_SHORT = 2;
-const INPUT_LONG = 3;
-
-// Long-press threshold: Flipper firmware fires LONG after ~300 ms of hold.
-// We use a slightly higher value so a quick tap can't accidentally trigger it
-// across browser keyboard-repeat startup latency.
-const LONG_PRESS_MS = 350;
-
-// Cap for the input wait-list. Mashing keys or holding auto-repeat past this
-// depth drops the extra events instead of letting a multi-second backlog build
-// up — the device would still be replaying old presses long after you let go.
+// Cap synthesized REPEAT events in the input wait-list. PRESS/SHORT/LONG and
+// especially RELEASE are never dropped: doing so would corrupt the firmware's
+// input sequence or leave a key stuck down.
 const MAX_PENDING_INPUTS = 8;
 
 function formatElapsed(ms: number): string {
@@ -62,39 +57,36 @@ function formatScale(scale: number): string {
   return `${scale}x`;
 }
 
-function DpadBtn({ icon, onShort, onLong, ariaLabel, label }: { icon: React.ReactNode; onShort: () => void; onLong: () => void; ariaLabel: string; label?: string }) {
-  const longTimer = useRef<number | null>(null);
-  const longSent = useRef(false);
+function DpadBtn({ icon, inputKey, input, ariaLabel, label }: { icon: React.ReactNode; inputKey: number; input: ScreenInputController; ariaLabel: string; label?: string }) {
+  const token = (pointerId: number) => `pointer:${pointerId}`;
 
-  // Mouse press lifecycle, mirroring the keyboard handler: a quick click sends
-  // SHORT; holding past LONG_PRESS_MS sends LONG instead. The end listener is on
-  // `window` (not the button) so releasing after dragging the cursor off the
-  // button still resolves the press and can't leak the long timer.
-  const begin = (e: React.MouseEvent) => {
+  const begin = (e: React.PointerEvent<HTMLButtonElement>) => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
     e.preventDefault();
-    longSent.current = false;
-    longTimer.current = window.setTimeout(() => {
-      longSent.current = true;
-      longTimer.current = null;
-      onLong();
-    }, LONG_PRESS_MS);
+    if (input.start(token(e.pointerId), inputKey)) {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    }
+  };
 
-    const end = () => {
-      window.removeEventListener("mouseup", end);
-      const wasLong = longSent.current;
-      if (longTimer.current != null) {
-        window.clearTimeout(longTimer.current);
-        longTimer.current = null;
-      }
-      if (!wasLong) onShort();
-    };
-    window.addEventListener("mouseup", end);
+  const finish = (e: React.PointerEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    input.finish(token(e.pointerId));
+  };
+
+  const cancel = (e: React.PointerEvent<HTMLButtonElement>) => {
+    input.cancel(token(e.pointerId));
   };
 
   return (
     <button
-      onMouseDown={begin}
+      type="button"
+      onPointerDown={begin}
+      onPointerUp={finish}
+      onPointerCancel={cancel}
+      onLostPointerCapture={cancel}
+      onContextMenu={(e) => e.preventDefault()}
       aria-label={ariaLabel}
+      style={{ touchAction: "none" }}
       className="flex flex-col items-center justify-center gap-0.5 w-9 h-9 rounded-md border border-border-subtle bg-surface hover:bg-elevated hover:border-flipper/40 active:bg-flipper/30 active:border-flipper text-secondary hover:text-primary transition-colors"
       title={ariaLabel}
     >
@@ -274,6 +266,32 @@ export function ScreenViewer() {
     return () => window.clearInterval(id);
   }, [isRecording, stopRecording]);
 
+  // Serial wait-list for input events. Each call chains onto the previous so
+  // only one `sendInputEvent` is in flight at a time. The input controller
+  // emits the same PRESS / SHORT-or-LONG / REPEAT / RELEASE lifecycle as the
+  // physical buttons and qFlipper for every key and every input source.
+  const inputChainRef = useRef<Promise<void>>(Promise.resolve());
+  const pendingInputsRef = useRef(0);
+
+  const enqueueInput = useCallback((key: number, inputType: number) => {
+    if (
+      inputType === INPUT_REPEAT &&
+      pendingInputsRef.current >= MAX_PENDING_INPUTS
+    ) return;
+    pendingInputsRef.current += 1;
+    inputChainRef.current = inputChainRef.current
+      .then(() => sendInputEvent(key, inputType))
+      .catch(() => {})
+      .finally(() => {
+        pendingInputsRef.current -= 1;
+      });
+  }, []);
+
+  const inputController = useMemo(
+    () => createScreenInputController(enqueueInput),
+    [enqueueInput],
+  );
+
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let mounted = true;
@@ -321,45 +339,23 @@ export function ScreenViewer() {
       // Discard any in-progress recording on unmount — we won't have the UI
       // around to prompt for a save path.
       recordingRef.current = null;
-      screenStreamStop().catch(() => {});
+      // Balance every pointer/keyboard PRESS before stopping the stream. The
+      // release events are appended to the same promise chain, so teardown
+      // cannot overtake them and leave a key held on the device.
+      inputController.cancelAll();
+      void inputChainRef.current.finally(() => {
+        screenStreamStop().catch(() => {});
+      });
       setConnected(false);
     };
-  }, []);
-
-  // Serial wait-list for input events. Each call chains onto the previous so
-  // only one `sendInputEvent` is in flight at a time — rapid clicks or held
-  // keys won't flood the backend channel and starve the screen-stream reader
-  // (which used to break BLE framing under input bursts).
-  const inputChainRef = useRef<Promise<void>>(Promise.resolve());
-  const pendingInputsRef = useRef(0);
-
-  const enqueueInput = useCallback((key: number, inputType: number) => {
-    if (pendingInputsRef.current >= MAX_PENDING_INPUTS) return;
-    pendingInputsRef.current += 1;
-    inputChainRef.current = inputChainRef.current
-      .then(() => sendInputEvent(key, inputType))
-      .catch(() => {})
-      .finally(() => {
-        pendingInputsRef.current -= 1;
-      });
-  }, []);
-
-  const press = useCallback((key: number) => {
-    enqueueInput(key, INPUT_SHORT);
-  }, [enqueueInput]);
-
-  const longPress = useCallback((key: number) => {
-    enqueueInput(key, INPUT_LONG);
-  }, [enqueueInput]);
+  }, [inputController]);
 
   // Global keyboard shortcuts while the viewer is open, without requiring focus.
   // Skip if the user is typing in an input (e.g. the CLI) so text entry wins.
   //
-  // Press lifecycle: keydown arms a LONG_PRESS_MS timer. If the key is released
-  // before it fires it's a SHORT; if the timer fires first it's a LONG. Either
-  // way exactly one event is emitted, and the backend brackets it with the
-  // PRESS / RELEASE the firmware needs. Browser auto-repeat is ignored — a held
-  // key is one press, not a stream of taps.
+  // Browser auto-repeat is ignored because the shared controller emits Flipper
+  // REPEAT events on its own after LONG. Pointer and keyboard holds therefore
+  // have exactly the same lifecycle for arrows, OK, and Back.
   useEffect(() => {
     if (!connected) return;
     const keyMap: Record<string, number> = {
@@ -367,20 +363,6 @@ export function ScreenViewer() {
       ArrowLeft: KEY_LEFT, ArrowRight: KEY_RIGHT,
       Enter: KEY_OK, Backspace: KEY_BACK,
     };
-    type HeldKey = { fkey: number; longTimer: number | null; longSent: boolean };
-    const held = new Map<string, HeldKey>();
-
-    // Cancel every armed timer without emitting anything — used on unmount/blur.
-    // Nothing is left "held" on the device because each press resolves to a
-    // self-contained SHORT/LONG (the backend supplies its own RELEASE), so an
-    // interrupted press simply does nothing rather than sticking a key down.
-    const cancelAll = () => {
-      for (const [, entry] of held) {
-        if (entry.longTimer != null) window.clearTimeout(entry.longTimer);
-      }
-      held.clear();
-    };
-
     const isTextTarget = (t: EventTarget | null) => {
       const el = t as HTMLElement | null;
       if (!el) return false;
@@ -394,40 +376,24 @@ export function ScreenViewer() {
       if (fkey === undefined) return;
       e.preventDefault();
       if (e.repeat) return; // hold = one press, not many
-      if (held.has(e.key)) return;
-
-      const entry: HeldKey = { fkey, longTimer: null, longSent: false };
-      entry.longTimer = window.setTimeout(() => {
-        entry.longSent = true;
-        entry.longTimer = null;
-        enqueueInput(fkey, INPUT_LONG);
-      }, LONG_PRESS_MS);
-      held.set(e.key, entry);
+      inputController.start(`keyboard:${e.code}`, fkey);
     };
 
     const onKeyUp = (e: KeyboardEvent) => {
-      const entry = held.get(e.key);
-      if (!entry) return;
-      held.delete(e.key);
-      // Released before the long timer fired → it was a SHORT tap. If the long
-      // already fired, it sent its own event and there's nothing left to do.
-      if (entry.longTimer != null) {
-        window.clearTimeout(entry.longTimer);
-        enqueueInput(entry.fkey, INPUT_SHORT);
-      }
+      if (inputController.finish(`keyboard:${e.code}`)) e.preventDefault();
     };
 
-    // Alt-tabbing mid-hold means we'd never see keyup; drop the pending press.
+    // Alt-tabbing mid-hold means we'd never see keyup; balance it with RELEASE.
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
-    window.addEventListener("blur", cancelAll);
+    window.addEventListener("blur", inputController.cancelAll);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
-      window.removeEventListener("blur", cancelAll);
-      cancelAll();
+      window.removeEventListener("blur", inputController.cancelAll);
+      inputController.cancelAll();
     };
-  }, [connected, enqueueInput]);
+  }, [connected, inputController]);
 
   // Fullscreen shortcuts: F toggles, Escape exits
   useEffect(() => {
@@ -611,17 +577,17 @@ export function ScreenViewer() {
           {/* Directional pad */}
           <div className="grid grid-cols-3 grid-rows-3 gap-1">
             <div />
-            <DpadBtn icon={<ArrowUp size={14} />} onShort={() => press(KEY_UP)} onLong={() => longPress(KEY_UP)} ariaLabel="Up" />
+            <DpadBtn icon={<ArrowUp size={14} />} inputKey={KEY_UP} input={inputController} ariaLabel="Up" />
             <div />
-            <DpadBtn icon={<ArrowLeft size={14} />} onShort={() => press(KEY_LEFT)} onLong={() => longPress(KEY_LEFT)} ariaLabel="Left" />
-            <DpadBtn icon={<Check size={14} />} onShort={() => press(KEY_OK)} onLong={() => longPress(KEY_OK)} ariaLabel="OK" />
-            <DpadBtn icon={<ArrowRight size={14} />} onShort={() => press(KEY_RIGHT)} onLong={() => longPress(KEY_RIGHT)} ariaLabel="Right" />
+            <DpadBtn icon={<ArrowLeft size={14} />} inputKey={KEY_LEFT} input={inputController} ariaLabel="Left" />
+            <DpadBtn icon={<Check size={14} />} inputKey={KEY_OK} input={inputController} ariaLabel="OK" />
+            <DpadBtn icon={<ArrowRight size={14} />} inputKey={KEY_RIGHT} input={inputController} ariaLabel="Right" />
             <div />
-            <DpadBtn icon={<ArrowDown size={14} />} onShort={() => press(KEY_DOWN)} onLong={() => longPress(KEY_DOWN)} ariaLabel="Down" />
+            <DpadBtn icon={<ArrowDown size={14} />} inputKey={KEY_DOWN} input={inputController} ariaLabel="Down" />
             <div />
           </div>
           {/* Back */}
-          <DpadBtn icon={<Undo2 size={14} />} onShort={() => press(KEY_BACK)} onLong={() => longPress(KEY_BACK)} ariaLabel="Back" label="Back" />
+          <DpadBtn icon={<Undo2 size={14} />} inputKey={KEY_BACK} input={inputController} ariaLabel="Back" label="Back" />
         </div>
       )}
     </div>
