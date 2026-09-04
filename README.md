@@ -5,7 +5,7 @@
 </div>
 
 <p align="center">
-  <img src="public/flipperui-icon.png" alt="FlipperUI" width="96" height="96">
+  <img src="public/flipperui-icon.png" alt="FlipperUI" width="177" height="177">
 </p>
 
 <p align="center">
