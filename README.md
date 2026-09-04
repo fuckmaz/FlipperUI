@@ -1,4 +1,8 @@
-# FlipperUI
+<div align="center">
+
+  # FlipperUI
+  
+</div>
 
 <p align="center">
   <img src="public/flipperui-icon.png" alt="FlipperUI" width="96" height="96">
