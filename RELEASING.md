@@ -43,6 +43,8 @@ creates a tag, release draft, or published release.
 2. Select **Build release bundles**.
 3. Choose **Run workflow** and the branch/commit to build.
 4. Wait for the macOS Apple Silicon, macOS Intel, Linux, and Windows jobs.
+   The Linux job also checks that the AppImage has a resolvable `.DirIcon`
+   and a catalog-compatible filename before the workflow can pass.
 5. Download their artifacts from the completed workflow run and smoke-test the
    packages you intend to publish.
 
@@ -55,7 +57,9 @@ does not create or modify anything on the repository's Releases page.
 2. Choose or create the matching tag, for example `v0.4.7`.
 3. Use `FlipperUI v0.4.7` as the title and paste the completed Markdown release
    notes into the description.
-4. Upload the tested installers from the workflow artifacts.
+4. Upload the tested installers from the workflow artifacts. Keep the generated
+   AppImage filename unchanged; do not add `Linux` to it because AppImage
+   catalogs reject that redundant platform marker.
 5. Leave **Set as a pre-release** off for a normal update.
 6. Review everything and click **Publish release**.
 

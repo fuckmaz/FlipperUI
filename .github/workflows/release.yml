@@ -2,7 +2,8 @@ name: Build release bundles
 
 # This workflow deliberately does not create a tag, draft, or GitHub Release.
 # Run it manually, test the resulting workflow artifacts, then create and
-# publish the release yourself from GitHub's Releases page.
+# publish the release yourself from GitHub's Releases page. Keep the generated
+# AppImage filename unchanged: AppImage catalogs reject names containing Linux.
 on:
   workflow_dispatch:
 
@@ -31,11 +32,12 @@ jobs:
             rust_target: x86_64-apple-darwin
             args: "--target x86_64-apple-darwin"
             label: macOS-Intel
-          # ubuntu-22.04 keeps the generated package compatible with older
-          # glibc versions. A .deb avoids AppImage/FUSE-specific requirements.
+          # ubuntu-22.04 keeps the generated packages compatible with older
+          # glibc versions. Keep Tauri CLI >=2.11.4: older versions produce a
+          # broken absolute .DirIcon symlink that AppImage catalogs reject.
           - platform: ubuntu-22.04
             rust_target: ""
-            args: "--bundles deb"
+            args: "--bundles deb,appimage"
             label: Linux
           - platform: windows-latest
             rust_target: ""
@@ -84,3 +86,8 @@ jobs:
           # tagName, releaseName, or releaseId, tauri-action cannot create one.
           uploadWorkflowArtifacts: true
           workflowArtifactNamePattern: "[platform]-[arch]-[bundle]"
+
+      - name: Validate AppImage catalog metadata
+        if: startsWith(matrix.platform, 'ubuntu')
+        shell: bash
+        run: scripts/validate-appimage.sh src-tauri/target/release/bundle/appimage/*.AppImage
