@@ -166,6 +166,11 @@ jobs:
             npm run tauri build -- --ci
           fi
 
+      - name: Validate AppImage catalog metadata (Linux)
+        if: matrix.label == 'Linux'
+        shell: bash
+        run: scripts/validate-appimage.sh src-tauri/${{ matrix.bundle_path }}/appimage/*.AppImage
+
       # Upload each bundle format as its own artifact so they are
       # individually downloadable from the Actions UI.
 
