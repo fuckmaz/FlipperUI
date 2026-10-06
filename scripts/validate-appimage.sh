@@ -38,10 +38,12 @@ for input_path in "$@"; do
     "$appimage" --appimage-extract >/dev/null
 
     appdir="$extract_dir/squashfs-root"
-    if [ ! -x "$appdir/AppRun" ]; then
-      echo "AppImage is missing an executable root AppRun: $filename" >&2
-      exit 1
-    fi
+    for launcher in "$appdir/AppRun" "$appdir/AppRun.wrapped"; do
+      if [ ! -f "$launcher" ] || [ -n "$(find "$launcher" ! -perm -001 -print -quit)" ]; then
+        echo "AppImage launcher must be executable by all users: $launcher" >&2
+        exit 1
+      fi
+    done
 
     shopt -s nullglob
     desktop_files=("$appdir"/*.desktop)
