@@ -43,8 +43,10 @@ creates a tag, release draft, or published release.
 2. Select **Build release bundles**.
 3. Choose **Run workflow** and the branch/commit to build.
 4. Wait for the macOS Apple Silicon, macOS Intel, Linux, and Windows jobs.
-   The Linux job also checks that the AppImage has a resolvable `.DirIcon`
-   and a catalog-compatible filename before the workflow can pass.
+   The Linux job strips the bundled `libwayland` from the AppImage (it causes
+   a blank window on current Mesa/NVIDIA, see issue #8), then checks that it
+   has no `libwayland`, a resolvable `.DirIcon`, and a catalog-compatible
+   filename before the workflow can pass.
 5. Download their artifacts from the completed workflow run and smoke-test the
    packages you intend to publish.
 

@@ -166,6 +166,13 @@ jobs:
             npm run tauri build -- --ci
           fi
 
+      # Bundled libwayland breaks EGL on current Mesa/NVIDIA (blank window,
+      # issue #8), so strip it before validating and uploading.
+      - name: Strip bundled libwayland from AppImage (Linux)
+        if: matrix.label == 'Linux'
+        shell: bash
+        run: scripts/strip-appimage-libs.sh src-tauri/${{ matrix.bundle_path }}/appimage/*.AppImage
+
       - name: Validate AppImage catalog metadata (Linux)
         if: matrix.label == 'Linux'
         shell: bash

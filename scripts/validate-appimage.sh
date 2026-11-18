@@ -46,6 +46,14 @@ for input_path in "$@"; do
     done
 
     shopt -s nullglob
+    # Bundled libwayland breaks EGL on current Mesa/NVIDIA (blank window,
+    # issue #8); scripts/strip-appimage-libs.sh removes it after the build.
+    bundled_wayland=("$appdir"/usr/lib/libwayland-*.so*)
+    if [ "${#bundled_wayland[@]}" -gt 0 ]; then
+      echo "AppImage must not bundle libwayland (run scripts/strip-appimage-libs.sh): ${bundled_wayland[*]##*/}" >&2
+      exit 1
+    fi
+
     desktop_files=("$appdir"/*.desktop)
     if [ "${#desktop_files[@]}" -eq 0 ]; then
       echo "AppImage is missing a root desktop file: $filename" >&2

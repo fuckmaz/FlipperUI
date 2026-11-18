@@ -84,10 +84,34 @@ jobs:
           args: ${{ matrix.args }}
           # Workflow artifacts are independent of GitHub Releases. With no
           # tagName, releaseName, or releaseId, tauri-action cannot create one.
-          uploadWorkflowArtifacts: true
+          # Linux uploads its own artifacts below, after the AppImage is fixed.
+          uploadWorkflowArtifacts: ${{ !startsWith(matrix.platform, 'ubuntu') }}
           workflowArtifactNamePattern: "[platform]-[arch]-[bundle]"
+
+      # Bundled libwayland breaks EGL on current Mesa/NVIDIA (blank window,
+      # issue #8), so strip it before validating and uploading.
+      - name: Strip bundled libwayland from AppImage
+        if: startsWith(matrix.platform, 'ubuntu')
+        shell: bash
+        run: scripts/strip-appimage-libs.sh src-tauri/target/release/bundle/appimage/*.AppImage
 
       - name: Validate AppImage catalog metadata
         if: startsWith(matrix.platform, 'ubuntu')
         shell: bash
         run: scripts/validate-appimage.sh src-tauri/target/release/bundle/appimage/*.AppImage
+
+      - name: Upload AppImage
+        if: startsWith(matrix.platform, 'ubuntu')
+        uses: actions/upload-artifact@v6
+        with:
+          name: linux-x86_64-appimage
+          if-no-files-found: error
+          path: src-tauri/target/release/bundle/appimage/*.AppImage
+
+      - name: Upload DEB
+        if: startsWith(matrix.platform, 'ubuntu')
+        uses: actions/upload-artifact@v6
+        with:
+          name: linux-x86_64-deb
+          if-no-files-found: error
+          path: src-tauri/target/release/bundle/deb/*.deb
