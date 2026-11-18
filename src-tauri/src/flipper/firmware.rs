@@ -1201,7 +1201,7 @@ fn unpack_update_archive_with_limits(bytes: &[u8], limits: ArchiveLimits) -> Res
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;

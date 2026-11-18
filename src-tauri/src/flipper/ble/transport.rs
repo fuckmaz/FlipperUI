@@ -260,7 +260,7 @@ impl Transport for BleTransport {
             // value below `n` between wait_free and here.
             let _ = self
                 .overflow
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
                     Some(v.saturating_sub(n))
                 });
         }
