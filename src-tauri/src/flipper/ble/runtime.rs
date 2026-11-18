@@ -30,20 +30,32 @@ pub static BLE_RT: Lazy<Runtime> = Lazy::new(|| {
 /// catching another advertisement within its scan window.
 static ADAPTER: OnceCell<Adapter> = OnceCell::const_new();
 
+/// btleplug refuses to open the adapter on macOS when Bluetooth access was
+/// denied in Privacy & Security; say so plainly instead of "Permission denied".
+fn map_init_err(e: btleplug::Error) -> FlipperError {
+    match e {
+        btleplug::Error::PermissionDenied if cfg!(target_os = "macos") => FlipperError::Internal(
+            "FlipperUI isn't allowed to use Bluetooth. Allow it in System Settings → \
+             Privacy & Security → Bluetooth, then restart FlipperUI."
+                .into(),
+        ),
+        btleplug::Error::PermissionDenied => FlipperError::Internal(
+            "FlipperUI isn't allowed to use Bluetooth. Check your system's Bluetooth \
+             permissions, then restart FlipperUI."
+                .into(),
+        ),
+        e => FlipperError::Internal(format!("BLE error: {e}")),
+    }
+}
+
 pub async fn shared_adapter() -> Result<Adapter> {
     ADAPTER
         .get_or_try_init(|| async {
-            let manager = Manager::new()
-                .await
-                .map_err(|e| FlipperError::Internal(format!("BLE error: {e}")))?;
-            let adapters = manager
-                .adapters()
-                .await
-                .map_err(|e| FlipperError::Internal(format!("BLE error: {e}")))?;
-            adapters
-                .into_iter()
-                .next()
-                .ok_or_else(|| FlipperError::Internal("No BLE adapter available".into()))
+            let manager = Manager::new().await.map_err(map_init_err)?;
+            let adapters = manager.adapters().await.map_err(map_init_err)?;
+            adapters.into_iter().next().ok_or_else(|| {
+                FlipperError::Internal("No Bluetooth adapter found on this computer.".into())
+            })
         })
         .await
         .cloned()

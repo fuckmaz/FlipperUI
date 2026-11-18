@@ -12,6 +12,12 @@ import { useFlipperStore } from "../../store/useFlipperStore";
 import { updateSettings } from "../../lib/settings";
 import { syncClockOnConnectIfEnabled } from "../../lib/clockSync";
 
+const IS_MACOS =
+  typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
+
+/** After this long with nothing found, show the usual suspects. */
+const SLOW_SCAN_HINT_MS = 15_000;
+
 interface BleDialogProps {
   onClose: () => void;
 }
@@ -84,6 +90,10 @@ export function BleDialog({ onClose }: BleDialogProps) {
   const [devices, setDevices] = useState<BleDevice[]>([]);
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Why the scan can't find anything (Bluetooth off, no permission, no
+  // adapter) — sent by the backend, cleared when it recovers.
+  const [problem, setProblem] = useState<string | null>(null);
+  const [slow, setSlow] = useState(false);
   const [connectingId, setConnectingId] = useState<string | null>(null);
 
   const setConnecting = useFlipperStore((s) => s.setConnecting);
@@ -97,6 +107,8 @@ export function BleDialog({ onClose }: BleDialogProps) {
 
   const start = async () => {
     setError(null);
+    setProblem(null);
+    setSlow(false);
     setScanning(true);
     try {
       await startBleScan();
@@ -123,6 +135,7 @@ export function BleDialog({ onClose }: BleDialogProps) {
   useEffect(() => {
     let unlistenDevice: UnlistenFn | null = null;
     let unlistenStopped: UnlistenFn | null = null;
+    let unlistenProblem: UnlistenFn | null = null;
     let cancelled = false;
 
     (async () => {
@@ -151,6 +164,12 @@ export function BleDialog({ onClose }: BleDialogProps) {
       if (cancelled) { u2(); return; }
       unlistenStopped = u2;
 
+      const u3 = await listen<string | null>("ble-scan-problem", (e) => {
+        setProblem(e.payload);
+      });
+      if (cancelled) { u3(); return; }
+      unlistenProblem = u3;
+
       if (!cancelled) await start();
     })();
 
@@ -158,10 +177,17 @@ export function BleDialog({ onClose }: BleDialogProps) {
       cancelled = true;
       unlistenDevice?.();
       unlistenStopped?.();
+      unlistenProblem?.();
       // Best-effort: stop the backend scan when the dialog closes.
       void stopBleScan().catch(() => {});
     };
   }, []);
+
+  useEffect(() => {
+    if (!scanning || devices.length > 0 || problem) return;
+    const t = window.setTimeout(() => setSlow(true), SLOW_SCAN_HINT_MS);
+    return () => window.clearTimeout(t);
+  }, [scanning, devices.length, problem]);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -243,10 +269,22 @@ export function BleDialog({ onClose }: BleDialogProps) {
         </div>
 
         <p className="text-xs text-secondary mb-3">
-          Pair the Flipper in your OS Bluetooth settings first. BLE supports
-          files, screen, and apps — but not CLI. Devices appear as they're
-          discovered; the scan runs until you connect or close the dialog.
+          {IS_MACOS
+            ? "No need to pair in System Settings first: on the first connect the Flipper shows a PIN, enter it in the macOS prompt."
+            : "Pair the Flipper in your OS Bluetooth settings first."}{" "}
+          BLE supports files, screen, and apps — but not CLI. Devices appear as
+          they're discovered; the scan runs until you connect or close the
+          dialog.
         </p>
+
+        {problem && (
+          <div
+            role="alert"
+            className="text-xs text-warning bg-warning/10 border border-warning/30 rounded px-2 py-1.5 mb-3"
+          >
+            {problem}
+          </div>
+        )}
 
         {error && (
           <div className="text-xs text-danger bg-danger/10 border border-danger/30 rounded px-2 py-1.5 mb-3">
@@ -255,17 +293,29 @@ export function BleDialog({ onClose }: BleDialogProps) {
         )}
 
         <div className="max-h-64 overflow-y-auto rounded border border-border-subtle divide-y divide-border-subtle">
-          {scanning && devices.length === 0 && (
-            <div className="flex items-center gap-2 p-3 text-xs text-secondary">
-              <Spinner size={13} />
-              Looking for Flippers…
+          {scanning && devices.length === 0 && !problem && (
+            <div className="p-3 text-xs text-secondary">
+              <div className="flex items-center gap-2">
+                <Spinner size={13} />
+                Looking for Flippers…
+              </div>
+              {slow && (
+                <p className="mt-2 text-muted">
+                  Still nothing? Make sure Bluetooth is on on the Flipper
+                  (Settings → Bluetooth), the screen is awake, and it isn't
+                  connected to your phone — a connected Flipper stops
+                  advertising.
+                </p>
+              )}
             </div>
           )}
-          {!scanning && devices.length === 0 && !error && (
+          {!scanning && devices.length === 0 && !error && !problem && (
             <div className="p-3 text-xs text-muted">
               No Flipper devices found. Make sure Bluetooth is enabled on the
-              Flipper (Settings → Bluetooth) and that it has been paired in
-              macOS Bluetooth settings.
+              Flipper (Settings → Bluetooth)
+              {IS_MACOS
+                ? " and that it isn't connected to your phone."
+                : " and that it has been paired in your OS Bluetooth settings."}
             </div>
           )}
           {devices.map((d) => {

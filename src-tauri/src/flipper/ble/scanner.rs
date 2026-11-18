@@ -1,14 +1,17 @@
 //! BLE device discovery.
 //!
-//! Runs a short (~1.8 s) scan, filters peripherals by the Flipper Serial service
-//! UUID or a `"Flipper "` name prefix, and returns a list of discoverable entries
-//! tagged with RSSI and a best-effort `paired` flag derived from cached services.
+//! Scans for peripherals and keeps the ones that look like a Flipper: any of the
+//! advertised `0x3080 | body colour` service UUIDs, the cached Serial service
+//! UUID, or a name containing "flipper". Entries are tagged with RSSI and a
+//! best-effort `paired` flag derived from cached services.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use btleplug::api::{Central, CentralEvent, Peripheral as _, ScanFilter};
+use btleplug::api::{
+    Central, CentralEvent, CentralState, Peripheral as _, PeripheralProperties, ScanFilter,
+};
 use btleplug::platform::PeripheralId;
 use futures::StreamExt;
 use tauri::{AppHandle, Emitter};
@@ -16,7 +19,7 @@ use tauri::{AppHandle, Emitter};
 use crate::error::{FlipperError, Result};
 use crate::flipper::ble::{
     runtime::{shared_adapter, BLE_RT},
-    ADVERTISED_SERVICE, SERIAL_SERVICE,
+    ADVERTISED_SERVICES, SERIAL_SERVICE,
 };
 
 /// A BLE device the user could connect to.
@@ -34,6 +37,74 @@ pub struct BleDevice {
 
 fn map_btle_err(err: impl std::fmt::Display) -> FlipperError {
     FlipperError::Internal(format!("BLE error: {err}"))
+}
+
+/// Shown in the BLE dialog while the host's Bluetooth radio is off.
+const BLUETOOTH_OFF: &str =
+    "Bluetooth is turned off on this computer. Turn it on and the scan will continue.";
+
+/// Which of the Flipper signals an advertisement carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FlipperMatch {
+    /// One of the `0x3080 | colour` UUIDs from the primary advertisement.
+    advertised: bool,
+    /// The custom Serial service UUID. Never advertised — it only shows up
+    /// once the OS has bonded and cached a service discovery, so it doubles
+    /// as the "paired" hint.
+    serial: bool,
+    /// Name heuristic. Stock firmware advertises "Flipper <name>", but
+    /// Momentum advertises the bare device name, so this can't be relied on.
+    name: bool,
+}
+
+impl FlipperMatch {
+    fn any(self) -> bool {
+        self.advertised || self.serial || self.name
+    }
+}
+
+fn match_flipper(name: &str, services: &[uuid::Uuid]) -> FlipperMatch {
+    FlipperMatch {
+        advertised: services.iter().any(|s| ADVERTISED_SERVICES.contains(s)),
+        serial: services.contains(&SERIAL_SERVICE),
+        name: name.to_lowercase().contains("flipper"),
+    }
+}
+
+/// Turn a scanned peripheral into a dialog entry, or `None` if it isn't a
+/// Flipper.
+fn flipper_device(id: String, props: &PeripheralProperties) -> Option<BleDevice> {
+    let name = props.local_name.clone().unwrap_or_default();
+    let m = match_flipper(&name, &props.services);
+    if !m.any() {
+        return None;
+    }
+    Some(BleDevice {
+        id,
+        name: if name.is_empty() {
+            "Flipper (unknown)".into()
+        } else {
+            name
+        },
+        rssi: props.rssi,
+        // `paired` drives the green icon and sort order in the dialog. Cached
+        // SERIAL_SERVICE is a strong signal the OS has bonded already; an
+        // advertised UUID only means the device is in range.
+        paired: m.serial,
+    })
+}
+
+/// Tell the BLE dialog why the scan can't find anything (`None` clears it).
+fn emit_problem(app: &AppHandle, problem: Option<&str>) {
+    let _ = app.emit("ble-scan-problem", problem);
+}
+
+/// User-facing text for an adapter that couldn't be opened.
+fn adapter_problem(err: &FlipperError) -> String {
+    match err {
+        FlipperError::Internal(msg) => msg.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// Scan for Flipper devices for ~1.8 s and return what's discoverable.
@@ -90,43 +161,20 @@ pub async fn list_ble_devices() -> Result<Vec<BleDevice>> {
             }
         };
         let name = props.local_name.clone().unwrap_or_default();
-        // Primary match: the 16-bit `0x3083` service UUID that Flipper Zero
-        // includes in its advertisement data (expanded via the BT base UUID).
-        let matches_advertised = props.services.contains(&ADVERTISED_SERVICE);
-        // Secondary match: the custom Serial service UUID. Not present in the
-        // advertisement — only populated in `props.services` once the OS has
-        // bonded and cached a service discovery. Treat its presence as a
-        // "paired" hint.
-        let matches_serial = props.services.contains(&SERIAL_SERVICE);
-        // Tertiary: case-insensitive name heuristic for bonded peripherals
-        // where CoreBluetooth returns a cached name even without ad-data.
-        let name_looks_like_flipper = name.to_lowercase().contains("flipper");
+        let m = match_flipper(&name, &props.services);
         tracing::info!(
-            "BLE candidate id={} name={:?} services={} rssi={:?} adv=0x3083:{} serial:{} name:{}",
+            "BLE candidate id={} name={:?} services={} rssi={:?} adv:{} serial:{} name:{}",
             p.id(),
             name,
             props.services.len(),
             props.rssi,
-            matches_advertised,
-            matches_serial,
-            name_looks_like_flipper,
+            m.advertised,
+            m.serial,
+            m.name,
         );
-        if !matches_advertised && !matches_serial && !name_looks_like_flipper {
-            continue;
+        if let Some(device) = flipper_device(p.id().to_string(), &props) {
+            out.push(device);
         }
-        out.push(BleDevice {
-            id: p.id().to_string(),
-            name: if name.is_empty() {
-                "Flipper (unknown)".into()
-            } else {
-                name
-            },
-            rssi: props.rssi,
-            // `paired` drives the green icon and sort order in the dialog.
-            // Cached SERIAL_SERVICE is a strong signal the OS has bonded
-            // already; seeing just 0x3083 only means the device is in range.
-            paired: matches_serial,
-        });
     }
     tracing::info!("BLE scan returning {} Flipper candidate(s)", out.len());
     Ok(out)
@@ -151,24 +199,8 @@ async fn maybe_emit_peripheral(
     let Ok(Some(props)) = p.properties().await else {
         return;
     };
-
-    let name = props.local_name.clone().unwrap_or_default();
-    let matches_advertised = props.services.contains(&ADVERTISED_SERVICE);
-    let matches_serial = props.services.contains(&SERIAL_SERVICE);
-    let name_looks_like_flipper = name.to_lowercase().contains("flipper");
-    if !matches_advertised && !matches_serial && !name_looks_like_flipper {
+    let Some(device) = flipper_device(p.id().to_string(), &props) else {
         return;
-    }
-
-    let device = BleDevice {
-        id: p.id().to_string(),
-        name: if name.is_empty() {
-            "Flipper (unknown)".into()
-        } else {
-            name
-        },
-        rssi: props.rssi,
-        paired: matches_serial,
     };
     let _ = app.emit("ble-scan-device", &device);
 }
@@ -183,12 +215,23 @@ pub async fn live_scan(app: AppHandle, cancel: Arc<AtomicBool>) -> Result<()> {
     // Always clear the running flag and notify the UI the scan has ended,
     // regardless of which exit path is taken below.
     let result = (async {
-        let Ok(adapter) = shared_adapter().await else {
-            // No adapter — emit nothing, the dialog will show an empty list.
-            return Ok::<(), FlipperError>(());
+        let adapter = match shared_adapter().await {
+            Ok(adapter) => adapter,
+            Err(e) => {
+                // No adapter or no permission. Without this the dialog would
+                // spin on "Looking for Flippers…" forever.
+                tracing::warn!("BLE live scan: adapter unavailable: {e}");
+                emit_problem(&app, Some(&adapter_problem(&e)));
+                return Ok::<(), FlipperError>(());
+            }
         };
 
         let mut events = adapter.events().await.map_err(map_btle_err)?;
+        if matches!(adapter.adapter_state().await, Ok(CentralState::PoweredOff)) {
+            emit_problem(&app, Some(BLUETOOTH_OFF));
+        }
+        // CoreBluetooth ignores a scan started while the radio is off, so the
+        // StateUpdate arm below restarts it once the radio powers on.
         adapter
             .start_scan(ScanFilter::default())
             .await
@@ -211,6 +254,17 @@ pub async fn live_scan(app: AppHandle, cancel: Arc<AtomicBool>) -> Result<()> {
                 | Ok(Some(CentralEvent::DeviceUpdated(id))) => {
                     maybe_emit_peripheral(&adapter, &id, &app).await;
                 }
+                Ok(Some(CentralEvent::StateUpdate(state))) => {
+                    tracing::info!("BLE adapter state changed: {state:?}");
+                    match state {
+                        CentralState::PoweredOn => {
+                            emit_problem(&app, None);
+                            let _ = adapter.start_scan(ScanFilter::default()).await;
+                        }
+                        CentralState::PoweredOff => emit_problem(&app, Some(BLUETOOTH_OFF)),
+                        CentralState::Unknown => {}
+                    }
+                }
                 Ok(Some(_)) => {} // ignore connect/disconnect/services events
                 Ok(None) => break,
                 Err(_) => continue, // timeout — recheck cancel
@@ -230,4 +284,63 @@ pub async fn live_scan(app: AppHandle, cancel: Arc<AtomicBool>) -> Result<()> {
 /// Blocking wrapper for `live_scan`. Safe to call from `spawn_blocking`.
 pub fn live_scan_blocking(app: AppHandle, cancel: Arc<AtomicBool>) -> Result<()> {
     BLE_RT.block_on(live_scan(app, cancel))
+}
+
+#[cfg(test)]
+mod tests {
+    use btleplug::api::bleuuid::uuid_from_u16;
+    use btleplug::api::PeripheralProperties;
+
+    use super::{flipper_device, match_flipper};
+    use crate::flipper::ble::SERIAL_SERVICE;
+
+    fn props(name: Option<&str>, services: Vec<uuid::Uuid>) -> PeripheralProperties {
+        PeripheralProperties {
+            local_name: name.map(str::to_owned),
+            services,
+            rssi: Some(-60),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn every_body_colour_uuid_matches() {
+        // 0x3080 | colour: unknown, black, white, transparent.
+        for short in [0x3080, 0x3081, 0x3082, 0x3083] {
+            let m = match_flipper("", &[uuid_from_u16(short)]);
+            assert!(m.advertised, "0x{short:04x} should match");
+        }
+    }
+
+    #[test]
+    fn momentum_bare_name_is_found_by_uuid() {
+        // Momentum advertises the device name without the "Flipper " prefix.
+        let device = flipper_device(
+            "id".into(),
+            &props(Some("Ulefo"), vec![uuid_from_u16(0x3082)]),
+        )
+        .expect("white Momentum Flipper should be listed");
+        assert_eq!(device.name, "Ulefo");
+        assert!(!device.paired);
+    }
+
+    #[test]
+    fn unrelated_devices_are_skipped() {
+        assert!(flipper_device(
+            "id".into(),
+            &props(Some("Ulefo"), vec![uuid_from_u16(0x180f)])
+        )
+        .is_none());
+        assert!(flipper_device("id".into(), &props(None, vec![uuid_from_u16(0x3084)])).is_none());
+        assert!(flipper_device("id".into(), &props(Some("AirPods"), vec![])).is_none());
+    }
+
+    #[test]
+    fn stock_name_and_cached_serial_still_match() {
+        assert!(match_flipper("Flipper Ulefo", &[]).name);
+        let device = flipper_device("id".into(), &props(None, vec![SERIAL_SERVICE]))
+            .expect("bonded Flipper should be listed");
+        assert_eq!(device.name, "Flipper (unknown)");
+        assert!(device.paired);
+    }
 }

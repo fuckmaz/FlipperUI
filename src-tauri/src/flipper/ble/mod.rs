@@ -15,12 +15,19 @@ pub mod transport;
 /// Flipper BLE Serial service (used post-connect for RPC data).
 pub const SERIAL_SERVICE: Uuid = uuid!("8fe5b3d5-2e7f-4a98-2a48-7acc60fe0000");
 
-/// 16-bit service UUID (`0x3083`) that Flipper Zero includes in its primary
-/// advertisement data. Expanded to 128-bit using the Bluetooth base UUID so it
-/// can be compared directly against the UUIDs btleplug returns in
-/// `PeripheralProperties.services`. This is what scan filtering should key off —
-/// `SERIAL_SERVICE` is not advertised, only discoverable after `connect`.
-pub const ADVERTISED_SERVICE: Uuid = uuid!("00003083-0000-1000-8000-00805f9b34fb");
+/// 16-bit service UUIDs Flipper Zero puts in its primary advertisement, as
+/// 128-bit UUIDs (Bluetooth base UUID) so they compare directly against
+/// `PeripheralProperties.services`. The firmware advertises
+/// `0x3080 | body colour` (`serial_profile.c`): 0x3080 unknown, 0x3081 black,
+/// 0x3082 white, 0x3083 transparent. Momentum's colour spoof picks from the
+/// same set. Scan filtering keys off these — `SERIAL_SERVICE` is not
+/// advertised, only discoverable after `connect`.
+pub const ADVERTISED_SERVICES: [Uuid; 4] = [
+    btleplug::api::bleuuid::uuid_from_u16(0x3080),
+    btleplug::api::bleuuid::uuid_from_u16(0x3081),
+    btleplug::api::bleuuid::uuid_from_u16(0x3082),
+    btleplug::api::bleuuid::uuid_from_u16(0x3083),
+];
 /// TX notify — device → host (data stream). UUIDs from firmware
 /// `serial_service_uuid.inc`: TX ends in `61fe`, RX ends in `62fe`.
 pub const TX_CHAR: Uuid = uuid!("19ed82ae-ed21-4c9d-4145-228e61fe0000");
